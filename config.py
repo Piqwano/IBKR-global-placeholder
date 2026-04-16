@@ -116,8 +116,9 @@ RESET_MAX_DD_ON_START = os.getenv("RESET_MAX_DD", "").lower() in ("1", "true", "
 #         OR SPY ≤ 200MA AND VIX < VIX_CAUTION_MAX_BELOW_200MA
 #   BEAR:    SPY ≤ 200MA AND VIX ≥ VIX_CAUTION_MAX_BELOW_200MA
 #
-# If VIX fetch fails, falls back to SPY-only:
-#   above 50MA+200MA → BULL, above 200MA → CAUTION, else BEAR.
+# SAFETY (B4): If USE_VIX_IN_REGIME=True but VIX fetch fails, the helper
+# degrades to CAUTION/BEAR only — NEVER BULL. Fallback to the SPY-only
+# 3-regime logic happens ONLY when USE_VIX_IN_REGIME=False (explicit opt-out).
 
 USE_VIX_IN_REGIME = True
 VIX_BULL_MAX = 20.0                       # BULL ceiling
@@ -203,6 +204,21 @@ STATE_SAVE_ON_EVERY_FILL = True
 # are trimmed (FIFO) once the cap is exceeded. Each record is ~300B so 10k
 # keeps the state file well under 5MB.
 TRADE_HISTORY_MAX_SIZE = 10_000
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ORPHAN POSITION ADOPTION
+# ══════════════════════════════════════════════════════════════════════════
+# SAFETY (H4): reconcile_existing_positions() runs on every startup. If the
+# operator manually buys a universe stock (mis-click, testing, external
+# tool), or if the state file is wiped, the bot would previously claim
+# every matching IBKR position and attach brackets using default exit
+# percentages. That's silent auto-management of a human trade.
+#
+# ADOPT_ORPHAN must be explicitly set to "1" for the bot to claim any
+# IBKR position not already in persisted bot_state.json. Default is to
+# SKIP orphans with a loud warning + Discord alert, leaving them alone
+# for the operator.
+ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATIONS

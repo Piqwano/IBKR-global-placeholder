@@ -3,8 +3,9 @@ IBKR Helpers — Connection, Data, Bracket Orders, Regime, Guards
 =================================================================
 Thread-safe connection management, event-driven trade waits with partial-fill
 handling, bracket orders with server-side TP + trailing stop, market-hours
-gating (including lunch breaks), atomic post-fill TP repair, VIX-aware
-market regime, and execution lookup for trade-history reconciliation.
+gating (including lunch breaks), atomic post-fill TP repair (in-place amend),
+VIX-aware market regime with safe degradation, and execution lookup for
+trade-history reconciliation.
 """
 
 import asyncio
@@ -190,6 +191,50 @@ def disconnect():
 
 def is_connected() -> bool:
     return _manager.is_connected()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ACCOUNT VALUE RESOLUTION  (B1)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _resolve_account_value(account_values, tag: str,
+                           allowed_currencies=("USD", "AUD", "CAD", "SGD", "GBP", "EUR")) -> float:
+    """
+    SAFETY (B1): Two-pass resolution to deterministically pick the BASE-currency
+    value for a given accountSummary tag. IBKR returns one row per currency the
+    account holds plus a BASE row — row order is NOT guaranteed. A single-pass
+    "take last matching currency" loop could leave us with a per-currency value
+    that excludes FX sub-accounts, under-reporting NLV/cash and mis-sizing
+    positions.
+
+    Pass 1: find BASE. If present, return it — always authoritative.
+    Pass 2: fallback to first allowed per-currency entry ONLY if no BASE row exists.
+    """
+    # Pass 1 — BASE is always authoritative
+    for item in account_values:
+        if item.tag == tag and item.currency == "BASE":
+            try:
+                return float(item.value)
+            except (TypeError, ValueError):
+                log.error(f"Malformed BASE value for {tag}: {item.value!r}")
+                return 0.0
+
+    # Pass 2 — no BASE found, fall back to a known currency (and log it)
+    for item in account_values:
+        if item.tag == tag and item.currency in allowed_currencies:
+            try:
+                val = float(item.value)
+                log.warning(
+                    f"⚠️  No BASE row for {tag} in accountSummary — "
+                    f"falling back to {item.currency} value {val}. "
+                    f"Verify IBKR account config."
+                )
+                return val
+            except (TypeError, ValueError):
+                continue
+
+    log.error(f"Could not resolve {tag} from accountSummary — returning 0.0 (conservative)")
+    return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -427,7 +472,7 @@ def analyze(contract) -> Optional[dict]:
 def get_vix_level() -> Optional[float]:
     """
     Fetch the latest VIX daily close via CBOE index data. Returns None if
-    unavailable — callers must fall back to SPY-only logic. Cached for
+    unavailable — callers must fall back per B4 policy. Cached for
     REGIME_CACHE_TTL seconds.
     """
     cached = _manager.get_vix_cache()
@@ -457,12 +502,12 @@ def get_vix_level() -> Optional[float]:
         _manager.set_vix_cache(level)
         return level
     except Exception as e:
-        log.warning(f"VIX fetch failed: {e} — regime will fall back to SPY-only")
+        log.warning(f"VIX fetch failed: {e} — regime will degrade per B4 policy")
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MARKET REGIME (SPY + VIX)
+#  MARKET REGIME (SPY + VIX)  (B4)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_market_regime() -> Tuple[str, float]:
@@ -475,8 +520,17 @@ def get_market_regime() -> Tuple[str, float]:
             OR SPY ≤ 200MA AND VIX <  CAUTION_MAX_BELOW                   (pullback but tame)
       BEAR:    SPY ≤ 200MA AND VIX ≥ CAUTION_MAX_BELOW
 
-    If VIX is unavailable, falls back to SPY-only: above 50MA+200MA → BULL,
-    above 200MA → CAUTION, else BEAR.
+    SAFETY (B4): When USE_VIX_IN_REGIME=True but the VIX fetch fails (CBOE
+    data outage, market-data entitlement issue, connection blip), the
+    fallback must NEVER return BULL. Historical precedent: during vol
+    shocks (SVB March 2023, Aug 2024), VIX can spike >30 while SPY is still
+    above its 50/200MA for 1–2 days. Old fallback would size 100% BULL
+    into that. New fallback caps at CAUTION above 200MA and BEAR below —
+    matches the stated conservative safety posture.
+
+    If USE_VIX_IN_REGIME=False (explicit opt-out), the SPY-only 3-regime
+    logic runs — this is a deliberate operator choice, distinct from a
+    VIX fetch failure.
     """
     from config import REGIME_SIZE_MULTIPLIERS
 
@@ -505,6 +559,7 @@ def get_market_regime() -> Tuple[str, float]:
     vix = get_vix_level() if USE_VIX_IN_REGIME else None
 
     if vix is not None:
+        # Normal VIX-aware path
         if above_200 and vix < VIX_BULL_MAX:
             regime = "BULL"
         elif above_200 and vix <= VIX_CAUTION_MAX_ABOVE_200MA:
@@ -516,14 +571,26 @@ def get_market_regime() -> Tuple[str, float]:
         else:
             regime = "BEAR"
         extra = f" | VIX {vix:.2f}"
+    elif USE_VIX_IN_REGIME:
+        # SAFETY (B4): VIX was EXPECTED but unavailable. NEVER return BULL.
+        # Cap at CAUTION above 200MA, BEAR below — conservative degraded mode.
+        regime = "CAUTION" if above_200 else "BEAR"
+        extra = " | VIX N/A (degraded: capped at CAUTION/BEAR)"
+        log.warning(
+            f"⚠️  VIX unavailable with USE_VIX_IN_REGIME=True — "
+            f"regime capped at {regime} (no BULL allowed without VIX confirmation)"
+        )
     else:
+        # USE_VIX_IN_REGIME=False — operator has deliberately disabled VIX.
+        # Run the original SPY-only 3-regime logic. Distinct from a VIX fetch
+        # failure: this is a conscious configuration choice.
         if above_200 and price > ma50:
             regime = "BULL"
         elif above_200:
             regime = "CAUTION"
         else:
             regime = "BEAR"
-        extra = " | VIX N/A (fallback)"
+        extra = " | VIX disabled (SPY-only)"
 
     mult = REGIME_SIZE_MULTIPLIERS[regime]
     emoji = {"BULL": "🟢", "CAUTION": "🟡", "BEAR": "🔴"}[regime]
@@ -538,27 +605,21 @@ def get_market_regime() -> Tuple[str, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  GUARDS
+#  GUARDS  (B1)
 # ══════════════════════════════════════════════════════════════════════════
 
 def cash_guard_check() -> Tuple[bool, float, float]:
+    """
+    SAFETY (B1): Uses _resolve_account_value for deterministic BASE-currency
+    resolution. Previous single-pass logic was non-deterministic w.r.t. IBKR's
+    row order — could skip BASE and end up with a per-currency sub-account
+    value, under-reporting NLV/cash and mis-sizing positions.
+    """
     ib = get_ib()
     try:
         account_values = ib.accountSummary()
-        cash = 0.0
-        portfolio = 0.0
-        cash_base, port_base = False, False
-        for item in account_values:
-            if item.tag == "TotalCashValue":
-                if item.currency == "BASE":
-                    cash = float(item.value); cash_base = True
-                elif not cash_base and item.currency in ("USD", "AUD", "CAD", "SGD", "GBP", "EUR"):
-                    cash = float(item.value)
-            elif item.tag == "NetLiquidation":
-                if item.currency == "BASE":
-                    portfolio = float(item.value); port_base = True
-                elif not port_base and item.currency in ("USD", "AUD", "CAD", "SGD", "GBP", "EUR"):
-                    portfolio = float(item.value)
+        cash = _resolve_account_value(account_values, "TotalCashValue")
+        portfolio = _resolve_account_value(account_values, "NetLiquidation")
 
         if portfolio <= 0:
             return False, 0.0, 0.0
@@ -649,6 +710,37 @@ def _safe_cancel(trade_or_order):
         ib.cancelOrder(order)
     except Exception:
         pass
+
+
+def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
+    """
+    SAFETY (B2): Modify an existing TP limit order IN PLACE by re-placing it
+    with the same orderId and an updated lmtPrice. IBKR treats same-orderId
+    re-placement as an amendment, which means:
+      - OCA group preserved  → trailing stop remains linked
+      - Order stays live throughout → ZERO unprotected window
+      - parentId / transmit flags untouched
+
+    The previous cancel-and-replace approach opened a ~2-second window with
+    no downside protection on every TP repair — this fires frequently on
+    volatile names (TSLA, NVDA, HK stocks) where the fill price differs
+    materially from the pre-placement estimate.
+
+    Returns True on successful submission. Does NOT touch the trailing stop.
+    """
+    if tp_trade is None or tp_trade.order is None:
+        return False
+    ib = get_ib()
+    try:
+        tp_trade.order.lmtPrice = round(new_limit_price, 2)
+        # Re-submit: same orderId, same contract → amendment, not a new order
+        ib.placeOrder(tp_trade.contract, tp_trade.order)
+        # Let the amendment land before returning
+        ib.waitOnUpdate(timeout=1.5)
+        return True
+    except Exception as e:
+        log.error(f"TP modify failed for {tp_trade.contract.symbol}: {e}")
+        return False
 
 
 def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: float,
@@ -767,6 +859,9 @@ def buy_stock_bracket(contract: Stock, amount: float,
         return None
 
     if not filled and filled_qty > 0:
+        # Partial fill path — parent didn't complete. We must cancel-replace
+        # the bracket because OCA qty cannot be modified in place; minimise
+        # the window by placing the new bracket immediately after cancelling.
         log.warning(f"⚠️  {contract.symbol} PARTIAL fill {filled_qty}/{qty} — "
                     f"cancelling parent remainder and resizing bracket")
         _safe_cancel(parent_trade)
@@ -792,29 +887,28 @@ def buy_stock_bracket(contract: Stock, amount: float,
         tp_order_id = str(tp_trade.order.orderId)
         trail_order_id = str(trail_trade.order.orderId)
 
+        # SAFETY (B2): Full fill path. If the TP limit price is materially off
+        # vs the actual fill price, AMEND THE EXISTING TP in place via
+        # _modify_tp_limit_price(). Do NOT cancel the OCA pair — cancelling
+        # opens a window of no downside protection. Amending preserves OCA
+        # linkage and keeps the position protected CONTINUOUSLY throughout
+        # the repair.
         if REPAIR_TP_AFTER_FILL:
             current_tp_price = tp_trade.order.lmtPrice
             correct_tp = round(actual_price * (1 + tp_pct), 2)
             if current_tp_price and abs(correct_tp - current_tp_price) / current_tp_price > 0.002:
-                log.info(f"  🔧 TP repair {contract.symbol}: ${current_tp_price:.2f} → ${correct_tp:.2f}")
-                try:
-                    _safe_cancel(tp_trade)
-                    _safe_cancel(trail_trade)
-                    ib.waitOnUpdate(timeout=2.0)
-                    new_tp, new_trail = _place_child_bracket_orders(
-                        contract, actual_qty, actual_price, trail_pct, tp_pct,
-                        oca_group_suffix=f"tprepair_{parent_trade.order.orderId}"
-                    )
-                    if new_tp and new_trail:
-                        tp_order_id = str(new_tp.order.orderId)
-                        trail_order_id = str(new_trail.order.orderId)
-                    else:
-                        log.critical(f"🚨 {contract.symbol}: TP repair failed to place "
-                                     f"new orders — POSITION IS UNPROTECTED")
-                        tp_order_id = None
-                        trail_order_id = None
-                except Exception as e:
-                    log.warning(f"TP repair failed for {contract.symbol}: {e}")
+                log.info(f"  🔧 TP repair {contract.symbol}: ${current_tp_price:.2f} → "
+                         f"${correct_tp:.2f} (in-place amend, trail untouched)")
+                if _modify_tp_limit_price(tp_trade, correct_tp):
+                    # tp_order_id unchanged — same order, amended in place
+                    log.info(f"     ✅ TP amended in place (orderId {tp_order_id})")
+                else:
+                    # Amendment failed — position still has OLD TP + trail
+                    # (protection is intact, just at a slightly off TP price).
+                    # Log loudly so operator can intervene.
+                    log.error(f"  ⚠️  TP amend failed for {contract.symbol}; "
+                              f"leaving original TP @ ${current_tp_price:.2f} "
+                              f"(position remains protected)")
 
     log.info(
         f"✅ BUY  {contract.symbol:<8} @ ${actual_price:.4f} qty:{actual_qty} "
@@ -939,19 +1033,32 @@ def cancel_all_orders():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  EXECUTION LOOKUP — for trade-history reconciliation
+#  EXECUTION LOOKUP — for trade-history reconciliation  (B3)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_recent_sell_fill(contract: Stock,
-                         lookback_seconds: int = 86400) -> Optional[dict]:
+                         lookback_seconds: int = 86400,
+                         opened_after: Optional[datetime] = None) -> Optional[dict]:
     """
-    Find the most recent SELL execution for this contract's conId within
-    the lookback window. Used when a position closes externally (bracket
-    trailing-stop or TP) so we can reconstruct exit price + size for the
-    trade-history log.
+    Find SELL executions for this contract within a bounded window and combine
+    all qualifying partial fills into a single exit record.
 
-    Returns {"price": float, "qty": int, "exec_id": str, "time": datetime}
-    or None if nothing found.
+    SAFETY (B3): Previously this returned only the most recent fill, which:
+      (a) under-reported qty when bracket fills split into 2+ partials
+          (common on thin liquidity: HK small caps, ASX, low-volume ETFs)
+      (b) risked pulling a stale fill from an EARLIER trade on the same
+          contract within the 24h lookback — attributing last trade's exit
+          to this trade's close, corrupting trade_history PnL.
+
+    Fix:
+      - If opened_after is provided (from pos["opened_at"]), use it as the
+        hard lower bound. Fills before this timestamp CANNOT belong to the
+        current position and are excluded.
+      - Sum all qualifying fills; compute weighted-average exit price.
+
+    Returns {"price": weighted_avg_px, "qty": total_qty,
+             "exec_id": latest_exec_id, "time": latest_exec_time}
+    or None if nothing qualifies.
     """
     ib = get_ib()
     try:
@@ -960,8 +1067,17 @@ def get_recent_sell_fill(contract: Stock,
         log.warning(f"ib.fills() failed for {contract.symbol}: {e}")
         return None
 
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
-    matching = []
+    # Floor: position open time (if known) wins over the generic lookback.
+    # Critical change — prevents cross-trade fill contamination.
+    generic_cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+    if opened_after is not None:
+        if opened_after.tzinfo is None:
+            opened_after = opened_after.replace(tzinfo=timezone.utc)
+        cutoff = max(generic_cutoff, opened_after)
+    else:
+        cutoff = generic_cutoff
+
+    qualifying: List[Tuple[datetime, "object"]] = []
     for fill in fills:
         try:
             if fill.contract.conId != contract.conId:
@@ -976,27 +1092,41 @@ def get_recent_sell_fill(contract: Stock,
                 exec_time = exec_time.replace(tzinfo=timezone.utc)
             if exec_time < cutoff:
                 continue
-            matching.append((exec_time, fill))
+            qualifying.append((exec_time, fill))
         except Exception:
             continue
 
-    if not matching:
+    if not qualifying:
         return None
 
-    matching.sort(key=lambda x: x[0], reverse=True)
-    exec_time, latest = matching[0]
-    try:
-        price = float(latest.execution.avgPrice or latest.execution.price or 0)
-        qty = int(float(latest.execution.shares or 0))
-    except Exception:
+    # Sum all partials; weighted-average price.
+    total_qty = 0
+    notional = 0.0
+    latest_time: Optional[datetime] = None
+    latest_exec_id: Optional[str] = None
+    for exec_time, fill in qualifying:
+        try:
+            px = float(fill.execution.avgPrice or fill.execution.price or 0)
+            sh = int(float(fill.execution.shares or 0))
+        except (TypeError, ValueError):
+            continue
+        if px <= 0 or sh <= 0:
+            continue
+        total_qty += sh
+        notional += px * sh
+        if latest_time is None or exec_time > latest_time:
+            latest_time = exec_time
+            latest_exec_id = fill.execution.execId
+
+    if total_qty <= 0 or notional <= 0:
         return None
-    if price <= 0 or qty <= 0:
-        return None
+
+    weighted_avg = notional / total_qty
     return {
-        "price": price,
-        "qty": qty,
-        "exec_id": latest.execution.execId,
-        "time": exec_time,
+        "price": round(weighted_avg, 4),
+        "qty": total_qty,
+        "exec_id": latest_exec_id,
+        "time": latest_time,
     }
 
 
@@ -1037,7 +1167,7 @@ def attach_bracket_to_existing_position(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  PORTFOLIO
+#  PORTFOLIO  (B1)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_all_positions() -> Dict[str, dict]:
@@ -1054,17 +1184,23 @@ def get_all_positions() -> Dict[str, dict]:
 
 
 def get_account_summary() -> dict:
+    """
+    SAFETY (B1): Uses _resolve_account_value for deterministic BASE-currency
+    resolution for every requested tag. The main loop reads NLV from here
+    for day rollover, loss limits, and DD tracking — every one of which
+    depends on this being correct and deterministic.
+    """
     ib = get_ib()
     summary = ib.accountSummary()
-    result = {}
     wanted = ("NetLiquidation", "TotalCashValue", "BuyingPower",
               "UnrealizedPnL", "RealizedPnL")
-    for item in summary:
-        if item.tag in wanted:
-            if item.currency == "BASE":
-                result[item.tag] = float(item.value)
-            elif item.tag not in result and item.currency in ("USD", "AUD", "CAD", "SGD", "GBP", "EUR"):
-                result[item.tag] = float(item.value)
+    result = {}
+    # Pre-compute the set of tags actually present so we only populate
+    # the result dict for real tags (preserves caller .get(tag, 0) semantics).
+    present_tags = {item.tag for item in summary}
+    for tag in wanted:
+        if tag in present_tags:
+            result[tag] = _resolve_account_value(summary, tag)
     return result
 
 

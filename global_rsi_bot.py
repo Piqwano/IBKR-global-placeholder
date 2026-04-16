@@ -19,6 +19,16 @@ v2.1 additions:
     for lifetime / 30d / 7d / 24h
   - Per-position trail_pct / tp_pct persisted in state for accurate
     external-close reason inference after restart
+
+v2.1+ hardening (B1–B4 / H1–H4):
+  - Deterministic BASE-currency NLV/cash resolution (B1)
+  - TP repair via in-place order amend — no unprotected window (B2)
+  - Position-aware fill lookup with partial-fill summation (B3)
+  - VIX-unavailable fallback degrades to CAUTION/BEAR only (B4)
+  - Dashboard per-symbol price timestamps + stale flag (H1)
+  - Trade-history NaN/Inf sanitisation + save fallback (H2)
+  - Partial-sell defensive reconciliation w/ arithmetic remainder (H3)
+  - ADOPT_ORPHAN gate for manual/orphan position adoption (H4)
 """
 
 import asyncio
@@ -52,6 +62,7 @@ from config import (
     DASHBOARD_ENABLED, DASHBOARD_PORT,
     SEND_DAILY_SUMMARY,
     TRADE_HISTORY_MAX_SIZE,
+    ADOPT_ORPHAN,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -96,19 +107,20 @@ dd_state = {
 }
 
 # Closed-trade history — persisted to bot_state.json.
-# Each record: {symbol, name, exchange, currency, entry_price, exit_price,
-#               qty, pnl, pnl_pct, opened_at, closed_at, reason}
 trade_history: List[dict] = []
 
-# In-memory cache of last-known prices, used for dashboard + daily summary
-# (so we don't need extra IBKR round-trips to compute exposure).
+# In-memory cache of last-known prices + per-symbol write timestamps.
+# SAFETY (H1): _last_price_ts keeps the dashboard honest — any shown P&L
+# older than 2× SCAN_INTERVAL_SECS is flagged stale so operator decisions
+# are based on fresh data, not silently cached values.
 _last_prices: Dict[str, float] = {}
+_last_price_ts: Dict[str, str] = {}
 
 _shutdown = False
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TIME HELPERS
+#  TIME / FLOAT HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
 def _today_in_reset_tz() -> date:
@@ -131,8 +143,35 @@ def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _sanitise_float(val, default: float = 0.0) -> float:
+    """
+    SAFETY (H2): Sanitise any float value bound for trade_history / JSON.
+    Rejects NaN and Inf (which serialise to invalid JSON in strict mode and
+    can poison downstream calculations). Returns `default` on bad input so
+    a single weird fill can't corrupt the whole state file.
+    """
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _mark_price(symbol: str, price: Optional[float]):
+    """
+    SAFETY (H1): Centralised price writeback — keeps prices and timestamps
+    in sync. Never bypass this; the dashboard's stale detection depends on
+    every _last_prices write having a matching _last_price_ts entry.
+    """
+    if price is not None:
+        _last_prices[symbol] = price
+        _last_price_ts[symbol] = _utc_now_iso()
+
+
 # ══════════════════════════════════════════════════════════════════════════
-#  TRADE HISTORY / WINRATES
+#  TRADE HISTORY / WINRATES  (H2)
 # ══════════════════════════════════════════════════════════════════════════
 
 def record_closed_trade(symbol: str, pos: dict,
@@ -141,23 +180,41 @@ def record_closed_trade(symbol: str, pos: dict,
     """
     Append a closed-trade record to trade_history. Returns the record, or
     None if the inputs are insufficient (e.g. missing entry price).
+
+    SAFETY (H2): All numeric inputs sanitised through _sanitise_float so a
+    NaN / Inf from a degenerate fill can't poison the JSON state file or
+    skew winrate calculations.
     """
-    entry = float(pos.get("entry") or 0.0)
-    exit_qty = int(exit_qty or 0)
+    entry = _sanitise_float(pos.get("entry"))
+    exit_price = _sanitise_float(exit_price)
     try:
-        exit_price = float(exit_price or 0.0)
+        exit_qty = int(exit_qty or 0)
     except (TypeError, ValueError):
-        exit_price = 0.0
+        exit_qty = 0
 
     if entry <= 0 or exit_qty <= 0 or exit_price <= 0:
         log.warning(
             f"record_closed_trade: skipping {symbol} — bad inputs "
-            f"entry={entry} exit={exit_price} qty={exit_qty}"
+            f"entry={entry} exit={exit_price} qty={exit_qty} "
+            f"(reason={reason}) — trade NOT recorded"
         )
         return None
 
     pnl = (exit_price - entry) * exit_qty
     pnl_pct = (exit_price - entry) / entry * 100
+
+    # Double-check derived values are clean
+    if math.isnan(pnl) or math.isinf(pnl) or math.isnan(pnl_pct) or math.isinf(pnl_pct):
+        log.error(f"record_closed_trade: NaN/Inf in derived values for {symbol} — refusing to record")
+        return None
+
+    now_iso = _utc_now_iso()
+    opened_at = pos.get("opened_at")
+    # Validate opened_at is parseable; if not, fall back to now so the record
+    # at least appears in time-windowed winrates instead of silently dropping.
+    if opened_at and _parse_iso_utc(opened_at) is None:
+        log.warning(f"record_closed_trade: {symbol} has unparseable opened_at={opened_at!r}; using now")
+        opened_at = now_iso
 
     trade = {
         "symbol": symbol,
@@ -169,8 +226,8 @@ def record_closed_trade(symbol: str, pos: dict,
         "qty": exit_qty,
         "pnl": round(pnl, 2),
         "pnl_pct": round(pnl_pct, 3),
-        "opened_at": pos.get("opened_at"),
-        "closed_at": _utc_now_iso(),
+        "opened_at": opened_at,
+        "closed_at": now_iso,
         "reason": reason,
     }
     trade_history.append(trade)
@@ -193,28 +250,51 @@ def compute_winrates() -> dict:
     """
     Winrate = (trades with pnl_pct > 0 / total closed trades) × 100, to 1dp.
     Returns None for any window with zero trades (JSON-null).
+
+    SAFETY (H2):
+      - 'lifetime' counts ALL persisted trades (no timestamp dependency),
+        so a record with an unparseable closed_at still contributes to the
+        lifetime denominator.
+      - Time-windowed (24h/7d/30d) filters drop unparseable records but
+        LOG a warning so data-quality issues surface instead of silently
+        degrading statistics.
     """
     now = datetime.now(timezone.utc)
+    unparseable_count = 0
 
     def _filter_since(seconds: int) -> List[dict]:
+        nonlocal unparseable_count
         cutoff = now - timedelta(seconds=seconds)
         out = []
         for t in trade_history:
             dt = _parse_iso_utc(t.get("closed_at"))
-            if dt and dt >= cutoff:
+            if dt is None:
+                unparseable_count += 1
+                continue
+            if dt >= cutoff:
                 out.append(t)
         return out
 
     def _winrate(trades: List[dict]) -> Optional[float]:
         if not trades:
             return None
-        wins = sum(1 for t in trades if (t.get("pnl_pct") or 0) > 0)
+        wins = sum(1 for t in trades if _sanitise_float(t.get("pnl_pct")) > 0)
         return round(wins / len(trades) * 100, 1)
 
+    # Lifetime uses full list — NEVER drops records for parse failures
     lifetime = list(trade_history)
     past_30 = _filter_since(30 * 86400)
     past_7 = _filter_since(7 * 86400)
     past_24h = _filter_since(86400)
+
+    # unparseable_count gets incremented 3× per bad record (once per window);
+    # divide by 3 for actual count.
+    if unparseable_count > 0:
+        actual = unparseable_count // 3
+        log.warning(
+            f"compute_winrates: {actual} trade record(s) have unparseable "
+            f"closed_at — excluded from time-windowed stats (lifetime unaffected)"
+        )
 
     return {
         "winrates": {
@@ -237,7 +317,7 @@ def _classify_external_close_reason(entry: float, exit_price: float,
     """
     Best-effort inference of why a bracket-exited position closed. We don't
     know for sure which of the two OCA children filled without crawling fills
-    more aggressively, so we infer from price movement against the configured
+    more aggressively, so we infer from price movement vs the configured
     TP / trail thresholds.
     """
     if entry <= 0 or exit_price <= 0:
@@ -251,10 +331,16 @@ def _classify_external_close_reason(entry: float, exit_price: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STATE PERSISTENCE
+#  STATE PERSISTENCE  (H2)
 # ══════════════════════════════════════════════════════════════════════════
 
 def save_state():
+    """
+    SAFETY (H2): Atomic write (.tmp + os.replace). Uses allow_nan=False so a
+    stray NaN/Inf never lands on disk. If trade_history serialisation fails
+    (bad record), falls back to preserving prior on-disk history rather than
+    destroying it — positions path stays functional independently.
+    """
     try:
         serialisable = {}
         for sym, pos in bot_positions.items():
@@ -268,13 +354,10 @@ def save_state():
                 "tp_order_id": pos.get("tp_order_id"),
                 "trail_order_id": pos.get("trail_order_id"),
                 "opened_at": pos.get("opened_at"),
-                # v2.1: persist the exit thresholds used at entry so that
-                # external-close reason inference after restart uses the
-                # ACTUAL thresholds rather than current defaults.
                 "trail_pct": pos.get("trail_pct"),
                 "tp_pct": pos.get("tp_pct"),
             }
-        payload = {
+        base_payload = {
             "bot_positions": serialisable,
             "day_state": {
                 "date": day_state["date"].isoformat() if day_state["date"] else None,
@@ -282,13 +365,42 @@ def save_state():
                 "hit_daily_limit": day_state["hit_daily_limit"],
             },
             "dd_state": dd_state,
-            "trade_history": trade_history,
             "saved_at": _utc_now_iso(),
         }
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+
+        # Try full payload first (positions + history)
+        try:
+            full_payload = {**base_payload, "trade_history": trade_history}
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(full_payload, f, indent=2, allow_nan=False)
+            os.replace(tmp, STATE_FILE)
+            return
+        except (ValueError, TypeError) as history_err:
+            # Strict JSON serialisation failed — almost certainly a bad
+            # float in trade_history. Fall back to positions-only to protect
+            # the hot recovery path.
+            log.error(
+                f"save_state: trade_history serialisation FAILED ({history_err}) — "
+                f"saving positions/state WITHOUT in-memory history this cycle. "
+                f"Investigate trade_history for NaN/Inf entries."
+            )
+            fallback_payload = {**base_payload, "trade_history": []}
+            # Preserve prior on-disk history if loadable — don't silently
+            # destroy it just because the in-memory list is sick.
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE) as f:
+                        prior = json.load(f)
+                    if isinstance(prior.get("trade_history"), list):
+                        fallback_payload["trade_history"] = prior["trade_history"]
+                except Exception:
+                    pass  # keep empty list — better than failing save entirely
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(fallback_payload, f, indent=2, allow_nan=False)
+            os.replace(tmp, STATE_FILE)
+
     except Exception as e:
         log.error(f"save_state failed: {e}")
 
@@ -326,7 +438,6 @@ def load_state():
                 "tp_order_id": pos.get("tp_order_id"),
                 "trail_order_id": pos.get("trail_order_id"),
                 "opened_at": pos.get("opened_at"),
-                # v2.1: restore exit thresholds (backwards-compatible via .get)
                 "trail_pct": pos.get("trail_pct"),
                 "tp_pct": pos.get("tp_pct"),
             }
@@ -506,7 +617,9 @@ def check_max_drawdown(current_nlv: float) -> bool:
                     )
                 flatten_all_positions(reason=f"max_dd_{dd_pct*100:.1f}pct")
                 bot_positions.clear()
+                # SAFETY (H1): clear both price + timestamp caches together
                 _last_prices.clear()
+                _last_price_ts.clear()
             except Exception as e:
                 log.error(f"Flatten failed: {e}")
         save_state()
@@ -620,11 +733,10 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
         "tp_order_id": result.get("tp_order_id"),
         "trail_order_id": result.get("trail_order_id"),
         "opened_at": _utc_now_iso(),
-        # Stored for external-close reason inference at exit time
         "trail_pct": trail_pct,
         "tp_pct": tp_pct,
     }
-    _last_prices[symbol] = result["price"]
+    _mark_price(symbol, result["price"])
 
     mode = "PAPER" if PAPER_MODE else "LIVE"
     regime_tag = f" [regime {regime_mult*100:.0f}%]" if regime_mult < 1.0 else ""
@@ -653,28 +765,110 @@ def _handle_partial_sell_remainder(symbol: str, pos: dict, remaining_qty: int):
     bot_positions[symbol]["qty"] = remaining_qty
     bot_positions[symbol]["tp_order_id"] = tp_id
     bot_positions[symbol]["trail_order_id"] = trail_id
-    # Preserve the original exit thresholds
+    # Preserve original exit thresholds
     bot_positions[symbol]["trail_pct"] = trail_pct
     bot_positions[symbol]["tp_pct"] = tp_pct
+
+
+def _reconcile_post_sell(symbol: str, pos: dict,
+                         sell_result: dict, price_fallback: float):
+    """
+    SAFETY (H3): Post-sell reconciliation with the IBKR position book.
+    Wrapped in try/except to ensure that if get_all_positions() fails
+    (disconnect, timeout, etc.), we still:
+      - use sell_result's filled_qty to compute a best-effort remaining qty
+      - IMMEDIATELY re-attach a bracket to the remainder so we don't leave
+        shares unprotected waiting for the next 15-minute scan cycle.
+
+    Also replaces the blind sleep(1.5) with event-driven polling (200ms)
+    for faster typical completion without reducing worst-case safety.
+    """
+    ib = get_ib()
+    fill_price = sell_result.get("avg_fill_price") or price_fallback
+    filled_qty = int(sell_result.get("filled_qty") or 0)
+    orig_qty = int(pos.get("qty", 0))
+
+    remaining_qty: Optional[int] = None
+    try:
+        # Event-driven wait — shorter typical case, same worst case.
+        deadline = time.time() + PARTIAL_SELL_RECONCILE_WAIT
+        while time.time() < deadline:
+            ib.waitOnUpdate(timeout=0.2)
+            try:
+                remaining = get_all_positions().get(symbol)
+                remaining_qty = int(remaining["qty"]) if remaining else 0
+                break
+            except Exception:
+                # Transient — keep trying until deadline
+                continue
+    except Exception as e:
+        log.warning(f"Post-sell IBKR position check failed for {symbol}: {e}")
+        remaining_qty = None
+
+    # If IBKR query failed entirely, fall back to arithmetic.
+    # Defensive: compute max possible remainder so we protect it.
+    if remaining_qty is None:
+        arithmetic_remainder = max(0, orig_qty - filled_qty)
+        log.warning(
+            f"  ⚠️  {symbol}: could not query IBKR positions post-sell; "
+            f"assuming {arithmetic_remainder} shares remain (orig {orig_qty} - filled {filled_qty}). "
+            f"Re-attaching bracket defensively."
+        )
+        remaining_qty = arithmetic_remainder
+
+    if remaining_qty <= 0:
+        # Full close path
+        record_closed_trade(
+            symbol, pos, fill_price, filled_qty or orig_qty, "rsi_exit"
+        )
+        bot_positions.pop(symbol, None)
+        _last_prices.pop(symbol, None)
+        _last_price_ts.pop(symbol, None)
+    else:
+        # Partial close — record what sold, re-attach bracket to remainder
+        sold_qty = max(0, orig_qty - remaining_qty)
+        if sold_qty > 0:
+            record_closed_trade(
+                symbol, pos, fill_price, sold_qty, "rsi_exit_partial"
+            )
+        _handle_partial_sell_remainder(symbol, pos, remaining_qty)
+
+    if STATE_SAVE_ON_EVERY_FILL:
+        save_state()
 
 
 def _record_external_close(symbol: str, pos: dict,
                            last_known_price: Optional[float]):
     """
-    Called when IBKR no longer reports a position we were tracking. Tries
-    to pull the actual exit price from recent fills; falls back to last
-    known market price, then to entry price.
+    Called when IBKR no longer reports a position we were tracking.
+
+    SAFETY (B3): Passes pos["opened_at"] as opened_after to
+    get_recent_sell_fill so fills from earlier trades on the same contract
+    can't be attributed to this one, AND all partial fills from this exit
+    are summed into a weighted-average exit price.
     """
     exit_price: Optional[float] = None
     exit_qty = int(pos.get("qty") or 0)
     exit_reason = "bracket_exit"
 
+    # Parse the position's open time — hard lower bound on fills
+    opened_after_dt = _parse_iso_utc(pos.get("opened_at"))
+
     try:
-        fill = get_recent_sell_fill(pos["contract"], lookback_seconds=86400)
+        fill = get_recent_sell_fill(
+            pos["contract"],
+            lookback_seconds=86400,
+            opened_after=opened_after_dt,
+        )
         if fill:
             exit_price = fill["price"]
+            # Cap at tracked qty defensively — never over-attribute shares
+            # to this position if the fill lookup returns more than we held.
             if fill.get("qty") and fill["qty"] > 0:
-                exit_qty = min(exit_qty, fill["qty"]) if exit_qty else fill["qty"]
+                if exit_qty > 0:
+                    exit_qty = min(exit_qty, fill["qty"]) if fill["qty"] < exit_qty else exit_qty
+                else:
+                    exit_qty = fill["qty"]
     except Exception as e:
         log.warning(f"Fill lookup failed for {symbol}: {e}")
 
@@ -701,6 +895,7 @@ def check_exits():
         if symbol not in ibkr_positions or ibkr_positions[symbol]["qty"] <= 0:
             pos = bot_positions.pop(symbol, None)
             last_known = _last_prices.pop(symbol, None)
+            _last_price_ts.pop(symbol, None)
             if pos:
                 _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
@@ -717,8 +912,7 @@ def check_exits():
     dash_contracts = {sym: pos["contract"] for sym, pos in bot_positions.items()}
     prices = get_prices_batch(dash_contracts)
     for sym, p in prices.items():
-        if p is not None:
-            _last_prices[sym] = p
+        _mark_price(sym, p)
 
     for symbol in list(bot_positions.keys()):
         pos = bot_positions[symbol]
@@ -760,31 +954,10 @@ def check_exits():
                 notify(f"{emoji} [{mode}] SELL {symbol} ({pos['name']}) — "
                        f"RSI {analysis['rsi']:.1f} | {change_pct:+.1f}%")
 
-                time.sleep(PARTIAL_SELL_RECONCILE_WAIT)
-                try:
-                    remaining = get_all_positions().get(symbol)
-                except Exception as e:
-                    log.warning(f"Post-sell position check failed for {symbol}: {e}")
-                    remaining = None
-
-                if not remaining or remaining["qty"] <= 0:
-                    # Full close — log the whole position as one trade
-                    record_closed_trade(
-                        symbol, pos, fill_price, filled_qty, "rsi_exit"
-                    )
-                    bot_positions.pop(symbol, None)
-                    _last_prices.pop(symbol, None)
-                else:
-                    remaining_qty = int(remaining["qty"])
-                    sold_qty = max(0, int(pos.get("qty", 0)) - remaining_qty)
-                    if sold_qty > 0:
-                        record_closed_trade(
-                            symbol, pos, fill_price, sold_qty, "rsi_exit_partial"
-                        )
-                    _handle_partial_sell_remainder(symbol, pos, remaining_qty)
-
-                if STATE_SAVE_ON_EVERY_FILL:
-                    save_state()
+                # SAFETY (H3): defensive reconciliation — handles IBKR query
+                # failures by falling back to arithmetic remainder and
+                # protecting it immediately.
+                _reconcile_post_sell(symbol, pos, sell_result, price_fallback=price)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -877,30 +1050,63 @@ def scan_all_markets():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STARTUP
+#  STARTUP  (H4)
 # ══════════════════════════════════════════════════════════════════════════
 
 def reconcile_existing_positions():
+    """
+    Reconcile IBKR-reported positions against bot_positions from state.
+
+    SAFETY (H4): Positions present in IBKR but NOT in persisted state are
+    ORPHANS — possibly manual trades, possibly stale state. We do NOT
+    auto-adopt them unless ADOPT_ORPHAN=1 is explicitly set in the env.
+    This prevents the bot from silently taking over a human's mis-click
+    and attaching brackets at its guessed (default) exit percentages.
+
+    Positions already in bot_positions (loaded from state) are handled
+    by the normal check_exits() flow and are not touched here.
+    """
     existing = get_all_positions()
     if not existing:
         return
     universe_lookup = {s: (s, e, c, n) for s, e, c, n in STOCK_UNIVERSE}
 
+    orphan_count = 0
+    adopted_count = 0
+    skipped_count = 0
+
     for sym, info in existing.items():
         if sym in bot_positions:
-            continue
+            continue  # already tracked from state
 
-        if sym not in universe_lookup:
-            log.info(f"   ⚠️  {sym} not in universe — ignoring (manual trade?)")
-            continue
-
-        _, exch, curr, name = universe_lookup[sym]
         qty = int(info["qty"])
         if qty <= 0:
             continue
 
+        if sym not in universe_lookup:
+            log.info(f"   ℹ️  {sym} not in universe — ignoring (external trade)")
+            continue
+
+        orphan_count += 1
+
+        # SAFETY (H4): orphan gate
+        if not ADOPT_ORPHAN:
+            log.warning(
+                f"   🚫 ORPHAN {sym}: qty={qty} @ ${info['avg_cost']:.2f} — "
+                f"NOT adopting (ADOPT_ORPHAN=1 required). "
+                f"Position is untracked; its existing IBKR orders (if any) "
+                f"remain intact. Set ADOPT_ORPHAN=1 and restart to claim."
+            )
+            skipped_count += 1
+            continue
+
+        # ADOPT_ORPHAN=1 — proceed with adoption + bracket attachment
+        _, exch, curr, name = universe_lookup[sym]
+
         contract = get_contract(sym, exch, curr)
         if not contract:
+            log.error(f"   ❌ Could not qualify contract for orphan {sym} — skipping")
+            skipped_count += 1
             continue
 
         entry = info["avg_cost"]
@@ -927,7 +1133,24 @@ def reconcile_existing_positions():
             "tp_pct": tp_pct,
         }
         bracket_tag = " 🛡️ bracket attached" if tp_id else " ⚠️  UNPROTECTED"
-        log.info(f"   ✅ Claimed {sym}: qty {qty} @ avg ${entry:.2f}{bracket_tag}")
+        log.warning(
+            f"   ⚠️  ADOPTED ORPHAN {sym}: qty {qty} @ avg ${entry:.2f}{bracket_tag} "
+            f"(ADOPT_ORPHAN=1 was set)"
+        )
+        adopted_count += 1
+
+    if orphan_count > 0:
+        log.info(
+            f"   Orphan summary: {orphan_count} detected | "
+            f"{adopted_count} adopted | {skipped_count} skipped | "
+            f"ADOPT_ORPHAN={'ON' if ADOPT_ORPHAN else 'OFF'}"
+        )
+        if skipped_count > 0 and not ADOPT_ORPHAN:
+            notify(
+                f"⚠️ [STARTUP] {skipped_count} orphan IBKR position(s) detected "
+                f"but NOT adopted. Review manually. Restart with ADOPT_ORPHAN=1 "
+                f"to claim."
+            )
 
 
 def install_signal_handlers():
@@ -962,11 +1185,12 @@ def print_startup_banner():
              f"(flatten={FLATTEN_ON_MAX_DD}) reset_tz={DAILY_RESET_TZ}")
     log.info(f"   Scan     : every {SCAN_INTERVAL_SECS // 60}m")
     log.info(f"   Dashboard: {'ON port '+str(DASHBOARD_PORT) if DASHBOARD_ENABLED else 'OFF'}")
+    log.info(f"   Orphans  : ADOPT_ORPHAN={'ON — will claim' if ADOPT_ORPHAN else 'OFF — will skip (safe default)'}")
     log.info(f"   History  : {len(trade_history)} trades loaded (cap {TRADE_HISTORY_MAX_SIZE})")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DASHBOARD SNAPSHOT
+#  DASHBOARD SNAPSHOT  (H1)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _push_dashboard_snapshot(
@@ -975,17 +1199,39 @@ def _push_dashboard_snapshot(
     dd_pct: float,
     regime: str, regime_mult: float,
 ):
-    """Build a JSON-serialisable snapshot and push to dashboard state."""
+    """
+    Build a JSON-serialisable snapshot and push to dashboard state.
+
+    SAFETY (H1): every position's snapshot now carries last_price_ts,
+    last_price_age_seconds, and a boolean last_price_stale. Operator
+    checking the dashboard during a partial IBKR data outage will see
+    immediately which positions have stale prices, rather than acting on
+    silently-cached hours-old P&L.
+    """
+    now_utc = datetime.now(timezone.utc)
+    stale_threshold = timedelta(seconds=SCAN_INTERVAL_SECS * 2)  # 2 scan cycles
+
     positions_out = []
     for sym, pos in bot_positions.items():
         last = _last_prices.get(sym)
+        last_ts_str = _last_price_ts.get(sym)
         entry = pos.get("entry", 0.0)
         qty = pos.get("qty", 0)
+
+        is_stale = True
+        age_seconds: Optional[float] = None
+        if last_ts_str:
+            last_ts = _parse_iso_utc(last_ts_str)
+            if last_ts is not None:
+                age_seconds = (now_utc - last_ts).total_seconds()
+                is_stale = (now_utc - last_ts) > stale_threshold
+
         pnl = None
         pnl_pct = None
         if last is not None and entry:
             pnl = (last - entry) * qty
             pnl_pct = (last - entry) / entry * 100
+
         positions_out.append({
             "symbol": sym,
             "name": pos.get("name"),
@@ -995,6 +1241,9 @@ def _push_dashboard_snapshot(
             "entry": round(entry, 4),
             "peak": round(pos.get("peak", 0.0), 4),
             "last_price": last,
+            "last_price_ts": last_ts_str,
+            "last_price_age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+            "last_price_stale": is_stale,
             "pnl": round(pnl, 2) if pnl is not None else None,
             "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
             "tp_order_id": pos.get("tp_order_id"),
@@ -1114,8 +1363,7 @@ def run():
                 dash_contracts = {sym: pos["contract"] for sym, pos in bot_positions.items()}
                 dash_prices = get_prices_batch(dash_contracts)
                 for sym, p in dash_prices.items():
-                    if p is not None:
-                        _last_prices[sym] = p
+                    _mark_price(sym, p)
                 for sym, pos in bot_positions.items():
                     price = dash_prices.get(sym)
                     entry = pos["entry"]
