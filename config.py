@@ -16,7 +16,7 @@ IB_HOST = os.getenv("IB_GATEWAY_HOST", "127.0.0.1")
 IB_PORT = int(os.getenv("IB_GATEWAY_PORT", "7497"))
 IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "10"))
 
-# PAPER vs LIVE toggle — controlled by env var, checked everywhere
+# PAPER vs LIVE toggle
 PAPER_MODE = os.getenv("TRADING_MODE", "paper").lower() == "paper"
 
 # Market data type: 1 = live (paid), 3 = delayed (free, 15-20 min lag)
@@ -26,58 +26,48 @@ MARKET_DATA_LIVE = os.getenv("IB_MARKET_DATA", "delayed").lower() == "live"
 #  RECONNECT / RESILIENCE
 # ══════════════════════════════════════════════════════════════════════════
 
-RECONNECT_INITIAL_DELAY = 5          # Seconds before first reconnect attempt
-RECONNECT_MAX_DELAY = 300            # Max backoff (5 min)
-RECONNECT_BACKOFF_FACTOR = 2.0       # Exponential backoff multiplier
-RECONNECT_MAX_ATTEMPTS = 0           # 0 = infinite retries
+RECONNECT_INITIAL_DELAY = 5
+RECONNECT_MAX_DELAY = 300
+RECONNECT_BACKOFF_FACTOR = 2.0
+RECONNECT_MAX_ATTEMPTS = 0           # 0 = infinite
 
-CONNECTION_TIMEOUT = 15              # Seconds to wait for connect()
-TRADE_FILL_TIMEOUT = 30              # Seconds to wait for a market order to fill
+CONNECTION_TIMEOUT = 15
+TRADE_FILL_TIMEOUT = 30
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STRATEGY — RSI (backtest-optimal values)
+#  STRATEGY — RSI
 # ══════════════════════════════════════════════════════════════════════════
 
 RSI_PERIOD = 14
-RSI_OVERSOLD = 40                    # Buy trigger
-RSI_OVERBOUGHT = 60                  # RSI-based exit (default, overridable per asset)
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
 
-# Entry filters — kept OFF by default because user's backtests showed OFF is optimal
-# with RSI 40/60. Flip to True here if you re-run backtests and prefer filtered entries.
-USE_VOLUME_FILTER = False            # Volume > 20-day avg
-USE_TREND_FILTER = False             # Price > 200-day MA
-USE_MA20_FILTER = False              # Price > 20-day MA (short-term trend confirmation)
+USE_VOLUME_FILTER = False
+USE_TREND_FILTER = False
+USE_MA20_FILTER = False
 
 # ══════════════════════════════════════════════════════════════════════════
 #  EXITS
 # ══════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TRAILING_STOP = 0.06         # 6% — backtest optimal
-DEFAULT_TAKE_PROFIT = 0.08           # 8% — backtest optimal
+DEFAULT_TRAILING_STOP = 0.06
+DEFAULT_TAKE_PROFIT = 0.08
 
-# ATR-based dynamic stops — experimental alternative to fixed pct stops
 USE_ATR_STOPS = False
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 1.5
 
-# Bracket orders — server-side TP + trailing stop attached on entry
-USE_BRACKET_ORDERS = True            # CRITICAL — survives restarts, protects if bot dies
-
-# After parent fill, re-price the take-profit limit to the ACTUAL fill price
-# (otherwise TP is based on pre-fill estimate and slippage distorts the target).
+USE_BRACKET_ORDERS = True
 REPAIR_TP_AFTER_FILL = True
-
-# When reconciling existing positions at startup, attach protective brackets
-# if none exist (prevents naked positions after a crash restart).
 REATTACH_BRACKETS_ON_RECONCILE = True
 
 # ══════════════════════════════════════════════════════════════════════════
-#  POSITION SIZING
+#  POSITION SIZING (base)
 # ══════════════════════════════════════════════════════════════════════════
 
 POSITION_SIZE_PCT = 0.15             # 15% per trade
-MAX_POSITIONS = 5                    # Across all markets
-CASH_RESERVE_PCT = 0.20              # Always keep 20% cash
+MAX_POSITIONS = 5
+CASH_RESERVE_PCT = 0.20
 
 REGIME_SIZE_MULTIPLIERS = {
     "BULL":    1.0,
@@ -86,20 +76,56 @@ REGIME_SIZE_MULTIPLIERS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-#  LOSS LIMITS (CRITICAL — trading halts)
+#  VOLATILITY-ADJUSTED POSITION SIZING
+# ══════════════════════════════════════════════════════════════════════════
+# Scales each new position by the ratio of target annualised volatility to
+# the stock's own annualised vol (ATR-based). Keeps portfolio-wide vol
+# contribution roughly constant across names of different volatility.
+#
+# Applied AFTER base size × regime multiplier:
+#   final_amount = base_amount × vol_scalar
+# where:
+#   annualised_vol = (ATR / price) × sqrt(252)
+#   vol_scalar     = VOL_TARGET_ANNUAL / annualised_vol   (clamped)
+#
+# Low-vol names get boosted (up to 1.8×), high-vol names get shrunk (down
+# to 0.4×).
+
+USE_VOL_ADJUSTED_SIZING = True
+VOL_TARGET_ANNUAL = 0.15            # 15% target annualised per-position vol
+ATR_PERIOD_FOR_SIZING = 20          # Separate ATR window for sizing
+VOL_SCALAR_MIN = 0.4                # Floor on vol scalar
+VOL_SCALAR_MAX = 1.8                # Ceiling on vol scalar
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LOSS LIMITS
 # ══════════════════════════════════════════════════════════════════════════
 
-DAILY_LOSS_LIMIT_PCT = 0.02          # -2% → halt new buys for the rest of the day
-MAX_DRAWDOWN_PCT = 0.15              # -15% from peak NLV → FLATTEN ALL + halt
+DAILY_LOSS_LIMIT_PCT = 0.02          # -2% daily → halt new buys
+MAX_DRAWDOWN_PCT = 0.15              # -15% from peak → flatten + halt
 FLATTEN_ON_MAX_DD = True
 
-# Timezone for "what is today" when tracking daily P&L reset.
-# Default: NYSE session boundary — changes at midnight NY time.
 DAILY_RESET_TZ = os.getenv("DAILY_RESET_TZ", "America/New_York")
-
-# Set env var RESET_MAX_DD=1 on restart to clear a previously-hit max-DD flag
-# (forces explicit opt-in to resuming trading after a max-DD halt).
 RESET_MAX_DD_ON_START = os.getenv("RESET_MAX_DD", "").lower() in ("1", "true", "yes")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MARKET REGIME — SPY + VIX
+# ══════════════════════════════════════════════════════════════════════════
+# Regime determination now uses both SPY trend and VIX level:
+#
+#   BULL:    SPY > 200MA  AND  VIX < VIX_BULL_MAX              (default <20)
+#   CAUTION: SPY > 200MA  AND  VIX_BULL_MAX ≤ VIX ≤ VIX_CAUTION_MAX_ABOVE_200MA
+#         OR SPY > 200MA  AND  VIX > VIX_CAUTION_MAX_ABOVE_200MA (defensive)
+#         OR SPY ≤ 200MA  AND  VIX < VIX_CAUTION_MAX_BELOW_200MA
+#   BEAR:    SPY ≤ 200MA  AND  VIX ≥ VIX_CAUTION_MAX_BELOW_200MA
+#
+# If VIX fetch fails (no subscription / API error), falls back to the old
+# SPY-only logic: above 50MA + 200MA → BULL, above 200MA → CAUTION, else BEAR.
+
+USE_VIX_IN_REGIME = True
+VIX_BULL_MAX = 20.0                       # BULL ceiling
+VIX_CAUTION_MAX_ABOVE_200MA = 25.0        # SPY up, but CAUTION if VIX ≤ 25
+VIX_CAUTION_MAX_BELOW_200MA = 22.0        # SPY down, still CAUTION if VIX < 22
 
 # ══════════════════════════════════════════════════════════════════════════
 #  COMMISSION FILTER
@@ -119,25 +145,15 @@ EXCHANGE_COMMISSIONS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SLIPPAGE MODEL (used by backtest)
+#  SLIPPAGE MODEL (backtest)
 # ══════════════════════════════════════════════════════════════════════════
 
 SLIPPAGE_BPS = {
-    "SMART": 2,
-    "ASX":   5,
-    "LSE":   5,
-    "IBIS":  8,
-    "SBF":   8,
-    "AEB":   8,
-    "SEHK":  10,
-    "SGX":   10,
+    "SMART": 2, "ASX": 5, "LSE": 5,
+    "IBIS": 8, "SBF": 8, "AEB": 8,
+    "SEHK": 10, "SGX": 10,
 }
 
-# ══════════════════════════════════════════════════════════════════════════
-#  BACKTEST FILL MODEL
-# ══════════════════════════════════════════════════════════════════════════
-# "next_open"  — signals on day T fill at day T+1's open (rigorous, no look-ahead)
-# "same_close" — signals on day T fill at day T's close (simpler, mildly optimistic)
 BACKTEST_FILL_MODE = "next_open"
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -150,7 +166,7 @@ SEHK_LOT_SIZES = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MARKET HOURS (with lunch-break support)
+#  MARKET HOURS
 # ══════════════════════════════════════════════════════════════════════════
 
 EXCHANGE_SESSIONS = {
@@ -177,7 +193,7 @@ MARKET_DATA_SNAPSHOT_WAIT = 3
 MARKET_DATA_BATCH_WAIT = 4
 RATE_LIMIT_PER_SYMBOL = 0.3
 ERROR_RETRY_DELAY = 60
-PARTIAL_SELL_RECONCILE_WAIT = 1.5   # Seconds to wait before reconciling after a sell
+PARTIAL_SELL_RECONCILE_WAIT = 1.5
 
 # ══════════════════════════════════════════════════════════════════════════
 #  STATE PERSISTENCE
@@ -191,6 +207,17 @@ STATE_SAVE_ON_EVERY_FILL = True
 # ══════════════════════════════════════════════════════════════════════════
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+
+SEND_DAILY_SUMMARY = True           # Discord summary at each day rollover
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DASHBOARD (FastAPI)
+# ══════════════════════════════════════════════════════════════════════════
+
+DASHBOARD_ENABLED = True
+# Railway sets PORT automatically for web services; fall back to 8000.
+# (Not a new config burden — if PORT isn't set, we just use 8000.)
+DASHBOARD_PORT = int(os.getenv("PORT", "8000"))
 
 # ══════════════════════════════════════════════════════════════════════════
 #  CORRELATION GROUPS

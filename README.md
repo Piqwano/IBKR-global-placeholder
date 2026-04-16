@@ -1,152 +1,168 @@
-# Global RSI Bot — IBKR
+# Global RSI Bot — IBKR (v2)
 
 Mean-reversion bot targeting ~137 stocks across US, ASX, LSE, XETRA, Euronext
 (Paris / Amsterdam), SEHK, and SGX. Buys RSI ≤ 40, exits at RSI ≥ 60, 6%
 trailing stop, or 8% take-profit.
 
-## Key features
+## What's new in v2
 
-- **Server-side bracket orders** — every buy submits an atomic parent market
-  order + OCA take-profit limit + OCA trailing stop. If the bot crashes, TP
-  and trailing stops remain active at IBKR.
-- **Partial fill handling** — if a market order partial-fills, the parent
-  remainder is cancelled and the OCA children are re-sized to the actual
-  filled quantity.
-- **TP repair after fill** — once the parent market order fills, the TP limit
-  is recalculated against the actual fill price and replaced if it drifted
-  more than 0.2% from the pre-fill estimate.
-- **Bracket re-attachment on restart** — any position found at startup that
-  is missing a protective sell order gets one attached.
-- **Market-hours gating** — per-exchange sessions with lunch breaks (e.g.
-  SEHK 12:00–13:00 HKT).
-- **Daily & max-drawdown halts** — −2% daily floor stops new buys for the
-  day, −15% from peak NLV flattens everything and requires `RESET_MAX_DD=1`
-  to resume.
-- **State persistence** — positions and halt flags are persisted to
-  `bot_state.json` atomically and reloaded on startup.
-- **Regime-aware sizing** — BULL 100%, CAUTION 35%, BEAR 0%.
-- **Correlation caps** — no more than 2 positions per correlation group
-  (e.g. us_big_tech, au_miners).
+| Feature | Description |
+|---------|-------------|
+| **Vol-adjusted sizing** | Each position is scaled by `VOL_TARGET_ANNUAL / (ATR%·√252)`, clamped to `[0.4, 1.8]`. Low-vol names get boosted, high-vol names shrunk — roughly equalising per-position risk contribution. |
+| **VIX-aware regime** | BULL = SPY > 200MA *and* VIX < 20. CAUTION = elevated VIX or SPY dip with tame VIX. BEAR = SPY < 200MA *and* VIX ≥ 22. Falls back to SPY-only if VIX fetch fails. |
+| **Daily Discord summary** | One clean message per day at rollover: PnL $/%, DD%, positions, exposure %, regime, NLV. Per-trade notifications are unchanged. |
+| **FastAPI dashboard** | `/health`, `/status`, `/positions`, `/docs` on port 8000 (Railway-exposed). Snapshot is written by the main loop — no extra IBKR calls from HTTP handlers. |
+
+## v1 features retained
+
+- **Server-side bracket orders** — atomic parent MKT + OCA TP + trailing stop.
+- **Partial fill handling** — resizes OCA children to filled qty.
+- **TP repair after fill** — replaces TP limit if drift > 0.2%.
+- **Bracket re-attachment on restart** — naked positions get protected automatically.
+- **Market-hours gating** with per-exchange lunch breaks.
+- **Daily & max-drawdown halts** — −2% daily floor, −15% from peak flattens all.
+- **Correlation caps** — 2 positions per correlation group.
+- **State persistence** — atomic JSON write, reload on startup.
 
 ## Files
 
 | File               | Role |
 |--------------------|------|
-| `config.py`        | All tunables — thresholds, universe, sessions, risk limits. |
-| `ibkr_helpers.py`  | IBKR connection mgmt, price/bars fetching, bracket orders. |
-| `global_rsi_bot.py`| Main loop. Entry point. |
-| `backtest.py`      | Historical backtest using yfinance data. |
+| `config.py`        | All tunables — universe, sessions, risk limits, v2 settings. |
+| `ibkr_helpers.py`  | IBKR connection mgmt, bars/prices, bracket orders, VIX fetch, regime. |
+| `global_rsi_bot.py`| Main loop. Entry point. Vol sizing + daily summary live here. |
+| `dashboard.py`     | Tiny FastAPI app. Background thread on port 8000. |
+| `backtest.py`      | Historical backtest via yfinance (v1 logic; vol sizing not yet ported). |
 | `Dockerfile`       | Bot container. |
 | `docker-compose.yml` | Bot + `ghcr.io/gnzsnz/ib-gateway:stable`. |
 
 ## Quick start
 
-### 1. Paper trading (recommended first)
+### Paper trading
 
 ```bash
-cp .env.example .env
-# edit .env — set TWS_USERID, TWS_PASSWORD, keep TRADING_MODE=paper
+cp .env.example .env        # edit TWS_USERID/TWS_PASSWORD
 docker compose up -d
 docker compose logs -f rsi-bot
+
+# Dashboard
+curl localhost:8000/health
+curl localhost:8000/status | jq
 ```
 
-### 2. Live trading
+### Live trading
 
 Edit `.env`:
 ```
 TRADING_MODE=live
 IB_GATEWAY_PORT=4003
 ```
+Then `docker compose down && docker compose up -d`.
+⚠️ IBKR live requires 2FA via the IBKR Key mobile app within ~3 min of each redeploy.
 
-Redeploy:
-```bash
-docker compose down
-docker compose up -d
-```
-
-⚠️ **IBKR live mode requires 2FA approval via the IBKR Key mobile app within
-2–3 minutes of each redeploy.** Have the app ready.
-
-### 3. Backtesting
+### Backtesting
 
 ```bash
 pip install -r requirements.txt
-python backtest.py                                   # last 3 years, full universe
-python backtest.py --start 2020-01-01 --capital 10000
-python backtest.py --us-only --symbols AAPL MSFT NVDA
-python backtest.py --fill-mode same_close            # legacy close-of-signal-day fill
+python backtest.py                                   # 3 years, full universe
+python backtest.py --us-only --capital 10000
 ```
 
-Outputs:
-- `backtest_trades.csv` — per-trade detail with commission + slippage
-- `backtest_equity.csv` — daily equity curve
-
-## Env flags
+## Env flags (no new env vars added in v2)
 
 | Var                   | Default           | Purpose |
 |-----------------------|-------------------|---------|
 | `TRADING_MODE`        | `paper`           | `paper` or `live` |
-| `IB_GATEWAY_PORT`     | `7497`            | `4004` paper, `4003` live (via socat) |
-| `IB_GATEWAY_HOST`     | `127.0.0.1`       | Gateway host (`ib-gateway` in docker compose) |
-| `IB_MARKET_DATA`      | `delayed`         | `delayed` (free) or `live` (paid subscription) |
-| `DAILY_RESET_TZ`      | `America/New_York`| Timezone for day roll-over |
-| `RESET_MAX_DD`        | *(empty)*         | Set to `1` to clear a persisted max-DD halt on restart |
+| `IB_GATEWAY_PORT`     | `7497`            | `4004` paper, `4003` live |
+| `IB_GATEWAY_HOST`     | `127.0.0.1`       | Gateway host (`ib-gateway` in compose) |
+| `IB_CLIENT_ID`        | `10`              | IB API client ID |
+| `IB_MARKET_DATA`      | `delayed`         | `delayed` (free) or `live` (paid) |
+| `DAILY_RESET_TZ`      | `America/New_York`| Timezone for daily P&L rollover |
+| `RESET_MAX_DD`        | *(empty)*         | Set to `1` to clear persisted max-DD halt |
 | `BOT_STATE_FILE`      | `bot_state.json`  | State file path |
-| `DISCORD_WEBHOOK`     | *(empty)*         | Optional webhook for trade notifications |
+| `DISCORD_WEBHOOK`     | *(empty)*         | Webhook for trade + daily summary notifications |
+| `PORT`                | `8000`            | Optional — if Railway sets `PORT`, dashboard uses it; else 8000 |
+
+## v2 configuration (in `config.py`)
+
+```python
+# Vol-adjusted sizing
+USE_VOL_ADJUSTED_SIZING = True
+VOL_TARGET_ANNUAL = 0.15
+ATR_PERIOD_FOR_SIZING = 20
+VOL_SCALAR_MIN = 0.4
+VOL_SCALAR_MAX = 1.8
+
+# VIX-aware regime
+USE_VIX_IN_REGIME = True
+VIX_BULL_MAX = 20.0
+VIX_CAUTION_MAX_ABOVE_200MA = 25.0
+VIX_CAUTION_MAX_BELOW_200MA = 22.0
+
+# Daily summary
+SEND_DAILY_SUMMARY = True
+
+# Dashboard
+DASHBOARD_ENABLED = True
+DASHBOARD_PORT = int(os.getenv("PORT", "8000"))
+```
+
+## Dashboard endpoints
+
+- `GET /health` → `{"status": "ok", "connected_to_ibkr": bool, "last_update": "..."}`
+- `GET /status` → NLV, cash, day PnL $/%, drawdown %, regime, VIX, halts
+- `GET /positions` → list of open positions with entry, last price, PnL
+- `GET /docs` → interactive Swagger UI
 
 ## Architecture notes
 
-### Bracket flow
+### VIX fetch
 
-1. `buy_stock_bracket` places `[parent_MKT, tp_LMT, trail_TRAIL]`. Parent and
-   first child have `transmit=False`; the trailing stop has `transmit=True`,
-   which atomically activates all three at IBKR.
-2. `_wait_for_fill` waits for terminal status of the parent.
-3. Three outcomes:
-   - **Zero fill / rejected** → cancel children, return None
-   - **Partial fill** → cancel parent remainder and both children, place a
-     new correctly-sized OCA pair
-   - **Full fill** → optionally repair TP price (if slippage drift > 0.2%)
-     by cancelling BOTH old children first, then placing a new OCA pair
-     (brief ~2s unprotected window, accepted to avoid duplicate trailing
-     stops racing in parallel).
+Uses `Index("VIX", "CBOE", "USD")` via `reqHistoricalData` (1-day bars, 5-day
+lookback, whatToShow="TRADES"). Cached for 30 min via the connection
+manager. If the fetch returns empty or errors (typical: no CBOE data
+subscription), `get_market_regime()` silently falls back to the v1 SPY-only
+logic (above 50MA+200MA → BULL, above 200MA → CAUTION, else BEAR).
 
-### Exit flow
+### Vol-scaling application point
 
-- **Bracket exit** (TP hit, trail hit, or manual IBKR close): the reconcile
-  phase of `check_exits` notices the position is gone from IBKR and pops it.
-- **RSI ≥ 60 exit**: cancel OCA siblings first, then market-sell. If the
-  sell is partial, wait 1.5s, query remaining qty, and re-attach a fresh
-  bracket.
+Applied **after** `base_amount = portfolio × POSITION_SIZE_PCT × regime_mult`
+and **before** the commission filter. Clamping to `[0.4, 1.8]` prevents
+outsized sizing on truly flat (low-vol) names and avoids shrinking
+genuinely high-vol names to meaningless dollar amounts. The commission
+filter therefore checks the adjusted amount.
 
-### Halts
+### Daily summary timing
 
-- **Daily loss limit** (−2%): halts new buys, preserves positions. Resets on
-  next `DAILY_RESET_TZ` midnight.
-- **Max drawdown** (−15% from NLV peak): flattens all, cancels everything,
-  persists `hit_max_dd=True` to state file. Requires `RESET_MAX_DD=1` env
-  var on restart to clear.
+Sent from `roll_over_day_if_needed` **before** `day_state` is reset, so the
+message uses yesterday's `start_nlv` and date. First run (where
+`day_state["date"] is None`) suppresses the summary. Subsequent rollovers
+fire exactly once per day at the first scan crossing `DAILY_RESET_TZ`
+midnight.
+
+### Dashboard concurrency
+
+`uvicorn.Server` runs in a daemon thread. `install_signal_handlers` is
+no-op'd because Python only allows signal installation from the main
+thread. The main loop writes to `dashboard._state` under a `threading.Lock`
+on every scan iteration; HTTP handlers read a dict snapshot under the
+same lock. No extra IBKR calls happen from the HTTP thread — everything
+served is cached state.
 
 ## Known limitations
 
-- LSE / some EU exchanges have tick-size grids finer than $0.01; the TP
-  limit price rounds to 2 decimals. If IBKR rejects on tick mismatch, the
-  order logs a reject — position is entered without bracket protection only
-  in the partial-fill-failed edge case.
-- Backtest uses yfinance data and merges trading days across markets;
-  signals that land on local holidays can silently drop. Live bot is
-  unaffected.
-- The RSI-exit vs bracket-fill path has a brief window where a bracket
-  could fill while the bot is evaluating the RSI. The bot self-heals via
-  reconciliation on the next iteration.
+- LSE tick-size grids finer than $0.01 may occasionally reject TP limits.
+- yfinance backtest merges trading days across markets; local-holiday
+  signals can silently drop. Live bot unaffected.
+- Vol-scaling not yet applied in `backtest.py` — compare expected vs
+  realised after a week of paper trading.
 
 ## Safety
 
-Start in paper mode. Let the bot run for at least one full week of scans
-and observe:
-- state file is being updated
-- bracket orders are visible in the IBKR TWS/Web UI
-- daily rollover happens at NY midnight
-- restart reconciliation correctly attaches brackets to existing positions
+Run paper for at least a week. Watch for:
+- Daily summary arriving at the configured `DAILY_RESET_TZ` midnight
+- `/status` endpoint responding with expected values
+- Vol-scalar log lines on buys (`📐 SYMBOL: ATR20=... → scalar=...`)
+- Regime lines showing VIX level (`Regime: BULL | SPY $... | VIX 15.3`)
 
 Then switch to live with a small deposit.

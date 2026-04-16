@@ -1,9 +1,10 @@
 """
-IBKR Helpers — Connection, Data, Bracket Orders, Guards
-=========================================================
+IBKR Helpers — Connection, Data, Bracket Orders, Regime, Guards
+=================================================================
 Thread-safe connection management, event-driven trade waits with partial-fill
 handling, bracket orders with server-side TP + trailing stop, market-hours
-gating (including lunch breaks), and atomic post-fill TP repair.
+gating (including lunch breaks), atomic post-fill TP repair, and a
+VIX-aware market regime detector.
 """
 
 import asyncio
@@ -19,15 +20,14 @@ import numpy as np
 import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────
-# CRITICAL: initialise an event loop BEFORE ib_insync is imported/constructed.
-# On Python 3.12+ and some 3.11 setups, IB() construction will fail otherwise.
+# Event loop must exist BEFORE ib_insync is imported/constructed.
 # ──────────────────────────────────────────────────────────────────────────
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from ib_insync import IB, Stock, MarketOrder, LimitOrder, Order, Trade, util
+from ib_insync import IB, Stock, Index, MarketOrder, LimitOrder, Order, Trade, util
 
 from config import (
     IB_HOST, IB_PORT, IB_CLIENT_ID,
@@ -39,15 +39,18 @@ from config import (
     RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY,
     RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_ATTEMPTS,
     EXCHANGE_SESSIONS, MARKET_HOURS_GRACE_MINS,
-    ATR_PERIOD, USE_BRACKET_ORDERS, REPAIR_TP_AFTER_FILL,
+    ATR_PERIOD, ATR_PERIOD_FOR_SIZING,
+    USE_BRACKET_ORDERS, REPAIR_TP_AFTER_FILL,
     DEFAULT_TRAILING_STOP, DEFAULT_TAKE_PROFIT,
+    USE_VIX_IN_REGIME,
+    VIX_BULL_MAX, VIX_CAUTION_MAX_ABOVE_200MA, VIX_CAUTION_MAX_BELOW_200MA,
 )
 
 log = logging.getLogger("ibkr-rsi")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  THREAD-SAFE CONNECTION MANAGER
+#  CONNECTION MANAGER
 # ══════════════════════════════════════════════════════════════════════════
 
 class IBConnectionManager:
@@ -59,6 +62,7 @@ class IBConnectionManager:
         self._contract_cache: Dict[str, Stock] = {}
         self._regime_cache: Optional[Tuple[str, float]] = None
         self._regime_time: float = 0.0
+        self._vix_cache: Optional[Tuple[float, float]] = None   # (level, ts)
         self._connected = False
         self._disconnect_handler_registered = False
 
@@ -162,6 +166,16 @@ class IBConnectionManager:
             self._regime_cache = value
             self._regime_time = _time.time()
 
+    def get_vix_cache(self) -> Optional[float]:
+        with self._lock:
+            if self._vix_cache and (_time.time() - self._vix_cache[1]) < REGIME_CACHE_TTL:
+                return self._vix_cache[0]
+            return None
+
+    def set_vix_cache(self, level: float):
+        with self._lock:
+            self._vix_cache = (level, _time.time())
+
 
 _manager = IBConnectionManager()
 
@@ -179,7 +193,7 @@ def is_connected() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MARKET HOURS (with lunch-break support)
+#  MARKET HOURS
 # ══════════════════════════════════════════════════════════════════════════
 
 def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool, str]:
@@ -202,7 +216,6 @@ def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool,
     if not (open_dt <= now <= close_dt):
         return False, f"{exchange} closed (local {now.strftime('%H:%M')}, session {sess['open']}-{sess['close']})"
 
-    # Lunch break (e.g. SEHK 12:00-13:00 HKT)
     lunch = sess.get("lunch")
     if lunch:
         lunch_start, lunch_end = lunch
@@ -247,7 +260,7 @@ def get_contract(symbol: str, exchange: str, currency: str) -> Optional[Stock]:
 #  HISTORICAL DATA
 # ══════════════════════════════════════════════════════════════════════════
 
-def get_daily_bars(contract: Stock, days: int = BARS_FOR_RSI) -> Optional[pd.DataFrame]:
+def get_daily_bars(contract, days: int = BARS_FOR_RSI) -> Optional[pd.DataFrame]:
     ib = get_ib()
     try:
         bars = ib.reqHistoricalData(
@@ -266,7 +279,7 @@ def get_daily_bars(contract: Stock, days: int = BARS_FOR_RSI) -> Optional[pd.Dat
             return None
         return df
     except Exception as e:
-        log.warning(f"Bars error {contract.symbol}/{contract.exchange}: {e}")
+        log.warning(f"Bars error {contract.symbol}/{getattr(contract,'exchange','?')}: {e}")
         return None
 
 
@@ -368,7 +381,8 @@ def calc_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     return round(float(atr), 4)
 
 
-def analyze(contract: Stock) -> Optional[dict]:
+def analyze(contract) -> Optional[dict]:
+    """Fetch bars and compute RSI, MAs, ATR(14) for stops, ATR(20) for sizing."""
     df = get_daily_bars(contract)
     if df is None or len(df) < RSI_PERIOD + 5:
         return None
@@ -392,21 +406,81 @@ def analyze(contract: Stock) -> Optional[dict]:
     trend_ok = price > ma200
     ma20_ok = price > ma20
 
-    atr = calc_atr(highs, lows, closes) if len(closes) > ATR_PERIOD else None
+    # ATR for stop-loss / ATR-based stops (period=14)
+    atr = calc_atr(highs, lows, closes, period=ATR_PERIOD) if len(closes) > ATR_PERIOD else None
+
+    # Separate, longer-window ATR used for vol-adjusted sizing (period=20)
+    atr_sizing = (calc_atr(highs, lows, closes, period=ATR_PERIOD_FOR_SIZING)
+                  if len(closes) > ATR_PERIOD_FOR_SIZING else None)
 
     return {
         "rsi": rsi, "price": price,
         "vol_ok": vol_ok, "trend_ok": trend_ok, "ma20_ok": ma20_ok,
         "ma20": round(ma20, 4), "ma50": round(ma50, 4), "ma200": round(ma200, 4),
-        "avg_volume": avg_vol, "atr": atr,
+        "avg_volume": avg_vol,
+        "atr": atr,
+        "atr_sizing": atr_sizing,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MARKET REGIME
+#  VIX
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_vix_level() -> Optional[float]:
+    """
+    Fetch the latest VIX daily close via CBOE index data. Returns None if
+    unavailable (no market-data subscription, weekend, etc.) — callers must
+    fall back to SPY-only logic. Cached for REGIME_CACHE_TTL seconds.
+    """
+    cached = _manager.get_vix_cache()
+    if cached is not None:
+        return cached
+
+    ib = get_ib()
+    try:
+        vix = Index("VIX", "CBOE", "USD")
+        qualified = ib.qualifyContracts(vix)
+        if not qualified:
+            log.warning("Could not qualify VIX contract (CBOE)")
+            return None
+        bars = ib.reqHistoricalData(
+            qualified[0],
+            endDateTime="",
+            durationStr="5 D",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        if not bars:
+            log.warning("VIX historical data returned empty")
+            return None
+        level = round(float(bars[-1].close), 2)
+        _manager.set_vix_cache(level)
+        return level
+    except Exception as e:
+        log.warning(f"VIX fetch failed: {e} — regime will fall back to SPY-only")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MARKET REGIME (SPY + VIX)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_market_regime() -> Tuple[str, float]:
+    """
+    VIX-aware regime detector.
+
+      BULL:    SPY > 200MA AND VIX < VIX_BULL_MAX
+      CAUTION: SPY > 200MA AND VIX in [BULL_MAX, CAUTION_MAX_ABOVE]       (elevated but ok)
+            OR SPY > 200MA AND VIX >  CAUTION_MAX_ABOVE                   (defensive)
+            OR SPY ≤ 200MA AND VIX <  CAUTION_MAX_BELOW                   (pullback but tame)
+      BEAR:    SPY ≤ 200MA AND VIX ≥ CAUTION_MAX_BELOW
+
+    If VIX is unavailable, falls back to SPY-only: above 50MA+200MA → BULL,
+    above 200MA → CAUTION, else BEAR.
+    """
     from config import REGIME_SIZE_MULTIPLIERS
 
     cached = _manager.get_regime_cache()
@@ -429,17 +503,40 @@ def get_market_regime() -> Tuple[str, float]:
     price = analysis["price"]
     ma50 = analysis["ma50"]
     ma200 = analysis["ma200"]
+    above_200 = price > ma200
 
-    if price > ma50 and price > ma200:
-        regime = "BULL"
-    elif price > ma200:
-        regime = "CAUTION"
+    vix = get_vix_level() if USE_VIX_IN_REGIME else None
+
+    if vix is not None:
+        if above_200 and vix < VIX_BULL_MAX:
+            regime = "BULL"
+        elif above_200 and vix <= VIX_CAUTION_MAX_ABOVE_200MA:
+            regime = "CAUTION"
+        elif above_200:
+            # SPY up but VIX elevated → defensive caution
+            regime = "CAUTION"
+        elif vix < VIX_CAUTION_MAX_BELOW_200MA:
+            # SPY down but VIX tame → still caution, not bear
+            regime = "CAUTION"
+        else:
+            regime = "BEAR"
+        extra = f" | VIX {vix:.2f}"
     else:
-        regime = "BEAR"
+        # Fallback: SPY-only three-tier logic
+        if above_200 and price > ma50:
+            regime = "BULL"
+        elif above_200:
+            regime = "CAUTION"
+        else:
+            regime = "BEAR"
+        extra = " | VIX N/A (fallback)"
 
     mult = REGIME_SIZE_MULTIPLIERS[regime]
     emoji = {"BULL": "🟢", "CAUTION": "🟡", "BEAR": "🔴"}[regime]
-    log.info(f"{emoji} Market regime: {regime} | SPY ${price:.2f} | 50MA ${ma50:.2f} | 200MA ${ma200:.2f}")
+    log.info(
+        f"{emoji} Regime: {regime} | SPY ${price:.2f} "
+        f"(50MA ${ma50:.2f}, 200MA ${ma200:.2f}){extra}"
+    )
 
     result = (regime, mult)
     _manager.set_regime_cache(result)
@@ -526,10 +623,6 @@ def _calc_quantity(contract: Stock, amount: float, price: float) -> Optional[int
 
 
 def _wait_for_fill(trade: Trade, timeout: float = TRADE_FILL_TIMEOUT) -> Tuple[bool, int]:
-    """
-    Wait for a trade to reach a terminal state.
-    Returns (fully_filled, filled_qty).
-    """
     ib = get_ib()
     deadline = _time.time() + timeout
     total_qty = int(trade.order.totalQuantity)
@@ -556,7 +649,6 @@ def _wait_for_fill(trade: Trade, timeout: float = TRADE_FILL_TIMEOUT) -> Tuple[b
 
 
 def _safe_cancel(trade_or_order):
-    """Cancel an order, swallowing any exception."""
     ib = get_ib()
     try:
         order = trade_or_order.order if hasattr(trade_or_order, 'order') else trade_or_order
@@ -568,11 +660,6 @@ def _safe_cancel(trade_or_order):
 def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: float,
                                 trail_pct: float, tp_pct: float,
                                 oca_group_suffix: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
-    """
-    Place TP + trailing-stop as a standalone OCA pair.
-    Used for bracket repair (partial fill resize / TP repair) and naked-position attach.
-    Cleans up orphans if one placement fails.
-    """
     ib = get_ib()
     oca = f"OCA_{contract.symbol}_{oca_group_suffix or int(_time.time())}"
     tp_price = round(entry_ref_price * (1 + tp_pct), 2)
@@ -601,7 +688,6 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
         return tp_trade, trail_trade
     except Exception as e:
         log.error(f"Child bracket placement failed for {contract.symbol}: {e}")
-        # Clean up whatever we managed to place
         if tp_trade is not None:
             _safe_cancel(tp_trade)
         if trail_trade is not None:
@@ -609,16 +695,8 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
         return None, None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  BRACKET ORDER (parent + OCA children)
-# ══════════════════════════════════════════════════════════════════════════
-
 def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
                    trail_pct: float, tp_pct: float) -> Optional[Tuple[Trade, Trade, Trade]]:
-    """
-    Parent market BUY (transmit=False) + OCA TP limit + OCA trailing stop (transmit=True).
-    All three submit atomically. Cleans up orphans if placement fails mid-sequence.
-    """
     ib = get_ib()
     parent_id = ib.client.getReqId()
     tp_id = ib.client.getReqId()
@@ -661,7 +739,6 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
         return parent_trade, tp_trade, trail_trade
     except Exception as e:
         log.error(f"Bracket placement failed for {contract.symbol}: {e}")
-        # Clean up any orphans
         for t in (parent_trade, tp_trade, trail_trade):
             if t is not None:
                 _safe_cancel(t)
@@ -670,9 +747,6 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
 
 def buy_stock_bracket(contract: Stock, amount: float,
                       trail_pct: float, tp_pct: float) -> Optional[dict]:
-    """
-    Buy with bracket. Handles full fill, partial fill (resize bracket), and TP repair.
-    """
     ib = get_ib()
     price = get_current_price(contract)
     if not price or price <= 0:
@@ -688,10 +762,9 @@ def buy_stock_bracket(contract: Stock, amount: float,
         return None
 
     parent_trade, tp_trade, trail_trade = result
-
     filled, filled_qty = _wait_for_fill(parent_trade)
 
-    # ── Case 1: zero fill (reject/cancel) ────────────────────────────────
+    # Case 1: zero fill
     if not filled and filled_qty == 0:
         reason = parent_trade.log[-1].message if parent_trade.log else "Unknown"
         status = parent_trade.orderStatus.status
@@ -700,7 +773,7 @@ def buy_stock_bracket(contract: Stock, amount: float,
         _safe_cancel(trail_trade)
         return None
 
-    # ── Case 2: partial fill — resize bracket children to filled qty ─────
+    # Case 2: partial fill → resize bracket
     if not filled and filled_qty > 0:
         log.warning(f"⚠️  {contract.symbol} PARTIAL fill {filled_qty}/{qty} — "
                     f"cancelling parent remainder and resizing bracket")
@@ -721,7 +794,7 @@ def buy_stock_bracket(contract: Stock, amount: float,
         tp_order_id = str(new_tp.order.orderId) if new_tp else None
         trail_order_id = str(new_trail.order.orderId) if new_trail else None
 
-    # ── Case 3: full fill — optionally repair TP price ───────────────────
+    # Case 3: full fill → optionally repair TP price
     else:
         actual_price = parent_trade.orderStatus.avgFillPrice or price
         actual_qty = int(parent_trade.orderStatus.filled or qty)
@@ -731,17 +804,12 @@ def buy_stock_bracket(contract: Stock, amount: float,
         if REPAIR_TP_AFTER_FILL:
             current_tp_price = tp_trade.order.lmtPrice
             correct_tp = round(actual_price * (1 + tp_pct), 2)
-            # Only repair if drift is meaningful (>0.2%)
             if current_tp_price and abs(correct_tp - current_tp_price) / current_tp_price > 0.002:
                 log.info(f"  🔧 TP repair {contract.symbol}: ${current_tp_price:.2f} → ${correct_tp:.2f}")
                 try:
-                    # Cancel BOTH old orders first — avoids window with duplicate
-                    # trailing stops active across different OCA groups.
                     _safe_cancel(tp_trade)
                     _safe_cancel(trail_trade)
                     ib.waitOnUpdate(timeout=2.0)
-                    # Position is briefly unprotected here (~2s). Acceptable trade-off
-                    # vs keeping two trailing stops racing in parallel.
                     new_tp, new_trail = _place_child_bracket_orders(
                         contract, actual_qty, actual_price, trail_pct, tp_pct,
                         oca_group_suffix=f"tprepair_{parent_trade.order.orderId}"
@@ -773,7 +841,6 @@ def buy_stock_bracket(contract: Stock, amount: float,
 
 
 def buy_stock_simple(contract: Stock, amount: float) -> Optional[dict]:
-    """Plain market buy without bracket. Only used if USE_BRACKET_ORDERS=False."""
     ib = get_ib()
     price = get_current_price(contract)
     if not price or price <= 0:
@@ -816,10 +883,6 @@ def buy_stock(contract: Stock, amount: float, trail_pct: float, tp_pct: float) -
 
 
 def sell_stock(contract: Stock, qty: float) -> Optional[dict]:
-    """
-    Market sell. Returns dict with order_id and filled_qty (or None on total reject).
-    On partial fill, cancels the remainder so it doesn't linger.
-    """
     ib = get_ib()
     qty = int(qty)
     if qty < 1:
@@ -876,7 +939,6 @@ def cancel_all_orders():
 # ══════════════════════════════════════════════════════════════════════════
 
 def has_protective_orders(contract: Stock) -> bool:
-    """Check if there's any resting SELL order on this contract (TP or stop)."""
     ib = get_ib()
     try:
         for t in ib.openTrades():
@@ -892,10 +954,6 @@ def attach_bracket_to_existing_position(
     trail_pct: float = DEFAULT_TRAILING_STOP,
     tp_pct: float = DEFAULT_TAKE_PROFIT
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Attach an OCA TP + trailing-stop to an existing naked long position.
-    Returns (tp_order_id, trail_order_id) or (None, None).
-    """
     if has_protective_orders(contract):
         log.info(f"   ℹ️  {contract.symbol} already has protective orders — skipping attach")
         return (None, None)

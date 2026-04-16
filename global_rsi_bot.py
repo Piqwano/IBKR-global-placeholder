@@ -1,14 +1,21 @@
 """
-Global RSI Bot — IBKR
-=======================
+Global RSI Bot — IBKR (v2)
+=============================
 Main loop: scan universe → RSI signals → server-side BRACKET orders
 (parent market + OCA TP + trailing stop). State persisted to disk.
 Daily loss limit + max-DD auto-flatten. Bracket re-attachment on restart.
+
+v2 additions:
+  - Volatility-adjusted position sizing (ATR-based vol targeting)
+  - VIX-aware market regime (via ibkr_helpers.get_market_regime)
+  - Daily P&L summary sent to Discord at each day rollover
+  - Embedded FastAPI dashboard (port 8000 by default)
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -31,16 +38,23 @@ from config import (
     RATE_LIMIT_PER_SYMBOL, ERROR_RETRY_DELAY,
     REGIME_SIZE_MULTIPLIERS, REATTACH_BRACKETS_ON_RECONCILE,
     PARTIAL_SELL_RECONCILE_WAIT,
+    # v2
+    USE_VOL_ADJUSTED_SIZING, VOL_TARGET_ANNUAL,
+    VOL_SCALAR_MIN, VOL_SCALAR_MAX,
+    DASHBOARD_ENABLED, DASHBOARD_PORT,
+    SEND_DAILY_SUMMARY,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
     get_contract, analyze,
-    get_market_regime, cash_guard_check, correlation_check,
+    get_market_regime, get_vix_level,
+    cash_guard_check, correlation_check,
     buy_stock, sell_stock, get_all_positions, get_account_summary,
     get_prices_batch, is_market_open,
     flatten_all_positions, cancel_open_orders_for,
     attach_bracket_to_existing_position,
 )
+from dashboard import start_dashboard, update_dashboard_state
 
 # ══════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -70,6 +84,10 @@ dd_state = {
     "peak_nlv": 0.0,
     "hit_max_dd": False,
 }
+
+# In-memory cache of last-known prices, used for dashboard + daily summary
+# (so we don't need extra IBKR round-trips to compute exposure).
+_last_prices: Dict[str, float] = {}
 
 _shutdown = False
 
@@ -196,12 +214,68 @@ def notify(message: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  DAILY SUMMARY
+# ══════════════════════════════════════════════════════════════════════════
+
+def send_daily_summary(current_nlv: float):
+    """
+    Called at day rollover BEFORE day_state is reset. Uses day_state still
+    holding yesterday's values (start_nlv, date).
+    """
+    if not SEND_DAILY_SUMMARY or not DISCORD_WEBHOOK:
+        return
+    if day_state["date"] is None or day_state["start_nlv"] <= 0:
+        return  # first run — nothing to summarise
+
+    start_nlv = day_state["start_nlv"]
+    day_pnl_dollars = current_nlv - start_nlv
+    day_pnl_pct = (day_pnl_dollars / start_nlv * 100) if start_nlv > 0 else 0.0
+
+    peak = dd_state["peak_nlv"]
+    dd_pct = ((current_nlv - peak) / peak * 100) if peak > 0 else 0.0
+
+    # Exposure: qty × last-known market price (fallback to entry)
+    total_exposure = 0.0
+    for sym, pos in bot_positions.items():
+        mkt = _last_prices.get(sym) or pos.get("entry", 0.0)
+        total_exposure += pos.get("qty", 0) * mkt
+    exposure_pct = (total_exposure / current_nlv * 100) if current_nlv > 0 else 0.0
+
+    try:
+        regime, _ = get_market_regime()
+    except Exception:
+        regime = "UNKNOWN"
+
+    mode = "PAPER" if PAPER_MODE else "LIVE"
+    emoji = "📈" if day_pnl_dollars >= 0 else "📉"
+    dd_emoji = "" if dd_pct >= -2 else (" ⚠️" if dd_pct > -10 else " 🛑")
+    date_str = day_state["date"].isoformat()
+
+    msg = (
+        f"{emoji} **[{mode}] Daily Summary — {date_str}**\n"
+        f"• NLV: ${current_nlv:,.2f}\n"
+        f"• Day P&L: ${day_pnl_dollars:+,.2f} ({day_pnl_pct:+.2f}%)\n"
+        f"• DD from peak: {dd_pct:+.2f}%{dd_emoji}\n"
+        f"• Open positions: {len(bot_positions)}  |  "
+        f"Exposure: {exposure_pct:.1f}% of NLV\n"
+        f"• Regime: {regime}"
+    )
+    notify(msg)
+    log.info(f"📬 Daily summary sent — {date_str} | PnL {day_pnl_pct:+.2f}% | "
+             f"Pos {len(bot_positions)} | Regime {regime}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  DAILY / DRAWDOWN CHECKS
 # ══════════════════════════════════════════════════════════════════════════
 
 def roll_over_day_if_needed(current_nlv: float):
     today = _today_in_reset_tz()
     if day_state["date"] != today:
+        # Send yesterday's summary BEFORE resetting (so day_state still has
+        # yesterday's start_nlv + date).
+        send_daily_summary(current_nlv)
+
         log.info(f"📅 New trading day ({DAILY_RESET_TZ}) — resetting daily tracker. "
                  f"Start NLV: ${current_nlv:,.2f}")
         day_state["date"] = today
@@ -249,6 +323,41 @@ def check_max_drawdown(current_nlv: float) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  VOLATILITY-ADJUSTED SIZING
+# ══════════════════════════════════════════════════════════════════════════
+
+def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
+    """
+    Scale a base position amount by target-vol / realised-vol. Returns the
+    adjusted amount. Clamps the scalar to [VOL_SCALAR_MIN, VOL_SCALAR_MAX].
+    """
+    if not USE_VOL_ADJUSTED_SIZING:
+        return base_amount
+
+    atr_sizing = analysis.get("atr_sizing")
+    price = analysis.get("price")
+    if not atr_sizing or not price or price <= 0:
+        return base_amount
+
+    atr_pct = atr_sizing / price                        # daily vol proxy
+    annualised_vol = atr_pct * math.sqrt(252)
+    if annualised_vol <= 0:
+        return base_amount
+
+    raw_scalar = VOL_TARGET_ANNUAL / annualised_vol
+    vol_scalar = max(VOL_SCALAR_MIN, min(VOL_SCALAR_MAX, raw_scalar))
+    adjusted = round(base_amount * vol_scalar, 2)
+
+    log.info(
+        f"  📐 {symbol}: ATR20={atr_pct*100:.2f}%/day → ann.vol {annualised_vol*100:.1f}% "
+        f"→ scalar {vol_scalar:.2f}"
+        f"{' (clamped)' if abs(vol_scalar - raw_scalar) > 1e-6 else ''}"
+        f" | ${base_amount:.2f} → ${adjusted:.2f}"
+    )
+    return adjusted
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  ENTRY
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -273,11 +382,15 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
     if portfolio <= 0:
         return
 
-    amount = round(portfolio * POSITION_SIZE_PCT * regime_mult, 2)
+    base_amount = round(portfolio * POSITION_SIZE_PCT * regime_mult, 2)
     if regime_mult < 1.0:
-        log.info(f"  ⚠️  {symbol}: regime mult {regime_mult*100:.0f}% → ${amount:.2f}")
+        log.info(f"  ⚠️  {symbol}: regime mult {regime_mult*100:.0f}% → base ${base_amount:.2f}")
+
+    # Apply vol-adjusted sizing on top of base × regime
+    amount = _apply_vol_scalar(symbol, base_amount, analysis)
+
     if amount < 10:
-        log.warning(f"  {symbol}: Position too small (${amount:.2f})")
+        log.warning(f"  {symbol}: Position too small after sizing (${amount:.2f})")
         return
 
     if not PAPER_MODE:
@@ -318,6 +431,7 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
         "trail_order_id": result.get("trail_order_id"),
         "opened_at": _utc_now_iso(),
     }
+    _last_prices[symbol] = result["price"]
 
     mode = "PAPER" if PAPER_MODE else "LIVE"
     regime_tag = f" [regime {regime_mult*100:.0f}%]" if regime_mult < 1.0 else ""
@@ -334,7 +448,6 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
 # ══════════════════════════════════════════════════════════════════════════
 
 def _handle_partial_sell_remainder(symbol: str, pos: dict, remaining_qty: int):
-    """Re-attach a bracket to the remaining shares after a partial sell."""
     log.warning(f"  ⚠️  {symbol}: partial sell — {remaining_qty} shares remain, re-attaching bracket")
     contract = pos["contract"]
     entry = pos["entry"]
@@ -355,6 +468,7 @@ def check_exits():
     for symbol in list(bot_positions.keys()):
         if symbol not in ibkr_positions or ibkr_positions[symbol]["qty"] <= 0:
             pos = bot_positions.pop(symbol, None)
+            _last_prices.pop(symbol, None)
             if pos:
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
@@ -369,6 +483,9 @@ def check_exits():
 
     dash_contracts = {sym: pos["contract"] for sym, pos in bot_positions.items()}
     prices = get_prices_batch(dash_contracts)
+    for sym, p in prices.items():
+        if p is not None:
+            _last_prices[sym] = p
 
     for symbol in list(bot_positions.keys()):
         pos = bot_positions[symbol]
@@ -393,7 +510,6 @@ def check_exits():
             change_pct = (price - entry) / entry * 100
             log.info(f"🔔 RSI exit {symbol} — RSI {analysis['rsi']:.1f} ≥ {rsi_exit}")
 
-            # Cancel OCA siblings BEFORE selling so we don't end up net short
             try:
                 cancel_open_orders_for(contract)
             except Exception as e:
@@ -409,9 +525,6 @@ def check_exits():
                 notify(f"{emoji} [{mode}] SELL {symbol} ({pos['name']}) — "
                        f"RSI {analysis['rsi']:.1f} | {change_pct:+.1f}%")
 
-                # Reconcile after sell — partial fills may leave shares on IBKR.
-                # Without this, we'd have unprotected shares (OCA siblings were cancelled
-                # pre-sell) and the bot would stop tracking them.
                 time.sleep(PARTIAL_SELL_RECONCILE_WAIT)
                 try:
                     remaining = get_all_positions().get(symbol)
@@ -421,6 +534,7 @@ def check_exits():
 
                 if not remaining or remaining["qty"] <= 0:
                     bot_positions.pop(symbol, None)
+                    _last_prices.pop(symbol, None)
                 else:
                     remaining_qty = int(remaining["qty"])
                     _handle_partial_sell_remainder(symbol, pos, remaining_qty)
@@ -494,20 +608,20 @@ def scan_all_markets():
             filters_passed = vol_ok and trend_ok and ma20_ok
 
             if rsi <= RSI_OVERSOLD and filters_passed:
-                signal = "🟢 SIGNAL"
+                sig = "🟢 SIGNAL"
                 signals_found += 1
             elif rsi <= RSI_OVERSOLD:
                 failed = []
                 if USE_VOLUME_FILTER and not analysis["vol_ok"]: failed.append("vol✗")
                 if USE_TREND_FILTER and not analysis["trend_ok"]: failed.append("trend✗")
                 if USE_MA20_FILTER and not analysis["ma20_ok"]: failed.append("ma20✗")
-                signal = f"🔵 RSI ok but {','.join(failed)}"
+                sig = f"🔵 RSI ok but {','.join(failed)}"
             elif rsi <= RSI_OVERSOLD + 10:
-                signal = "🟡 approaching"
+                sig = "🟡 approaching"
             else:
-                signal = ""
+                sig = ""
 
-            log.info(f"  {symbol:<8} {name:<20} ${price:<10.2f} RSI:{rsi:5.1f} ({gap:+.1f}) {signal}")
+            log.info(f"  {symbol:<8} {name:<20} ${price:<10.2f} RSI:{rsi:5.1f} ({gap:+.1f}) {sig}")
 
             if rsi <= RSI_OVERSOLD and filters_passed:
                 log.info(f"  🚨 {symbol}: attempting buy")
@@ -581,7 +695,7 @@ def install_signal_handlers():
 
 def print_startup_banner():
     mode = "PAPER" if PAPER_MODE else "⚠️  LIVE"
-    log.info(f"🌍 Global RSI Bot — [{mode}]")
+    log.info(f"🌍 Global RSI Bot v2 — [{mode}]")
     log.info(f"   Universe : {len(STOCK_UNIVERSE)} stocks across US/ASX/UK/EU/HK/CA/SG")
     log.info(f"   RSI      : oversold={RSI_OVERSOLD} overbought={RSI_OVERBOUGHT} period=14")
     log.info(f"   Filters  : Vol={'ON' if USE_VOLUME_FILTER else 'OFF'} "
@@ -591,15 +705,84 @@ def print_startup_banner():
              f"TP={DEFAULT_TAKE_PROFIT*100:.0f}% + RSI≥{RSI_OVERBOUGHT}")
     log.info(f"   Brackets : {'✅ server-side OCA' if USE_BRACKET_ORDERS else '❌ polling (UNSAFE)'}")
     log.info(f"   ATR stops: {'ON ('+str(ATR_MULTIPLIER)+'×ATR)' if USE_ATR_STOPS else 'OFF'}")
-    log.info(f"   Size     : {POSITION_SIZE_PCT*100:.0f}% | Max {MAX_POSITIONS} pos | "
-             f"Cash reserve {CASH_RESERVE_PCT*100:.0f}%")
-    log.info(f"   Regime   : BULL={REGIME_SIZE_MULTIPLIERS['BULL']*100:.0f}% "
+    log.info(f"   Sizing   : base {POSITION_SIZE_PCT*100:.0f}% × regime"
+             f"{' × vol-scalar ['+str(VOL_SCALAR_MIN)+'–'+str(VOL_SCALAR_MAX)+']' if USE_VOL_ADJUSTED_SIZING else ''}"
+             f" | target ann.vol {VOL_TARGET_ANNUAL*100:.0f}% | max {MAX_POSITIONS} pos")
+    log.info(f"   Regime   : SPY + VIX | BULL={REGIME_SIZE_MULTIPLIERS['BULL']*100:.0f}% "
              f"CAUTION={REGIME_SIZE_MULTIPLIERS['CAUTION']*100:.0f}% "
              f"BEAR={REGIME_SIZE_MULTIPLIERS['BEAR']*100:.0f}%")
     log.info(f"   Loss lim : Daily={DAILY_LOSS_LIMIT_PCT*100:.1f}% "
              f"MaxDD={MAX_DRAWDOWN_PCT*100:.1f}% "
              f"(flatten={FLATTEN_ON_MAX_DD}) reset_tz={DAILY_RESET_TZ}")
     log.info(f"   Scan     : every {SCAN_INTERVAL_SECS // 60}m")
+    log.info(f"   Dashboard: {'ON port '+str(DASHBOARD_PORT) if DASHBOARD_ENABLED else 'OFF'}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DASHBOARD SNAPSHOT
+# ══════════════════════════════════════════════════════════════════════════
+
+def _push_dashboard_snapshot(
+    nlv: float, cash: float,
+    day_pnl_pct: float, day_pnl_dollars: float,
+    dd_pct: float,
+    regime: str, regime_mult: float,
+):
+    """Build a JSON-serialisable snapshot and push to dashboard state."""
+    positions_out = []
+    for sym, pos in bot_positions.items():
+        last = _last_prices.get(sym)
+        entry = pos.get("entry", 0.0)
+        qty = pos.get("qty", 0)
+        pnl = None
+        pnl_pct = None
+        if last is not None and entry:
+            pnl = (last - entry) * qty
+            pnl_pct = (last - entry) / entry * 100
+        positions_out.append({
+            "symbol": sym,
+            "name": pos.get("name"),
+            "exchange": pos.get("exchange"),
+            "currency": pos.get("currency"),
+            "qty": qty,
+            "entry": round(entry, 4),
+            "peak": round(pos.get("peak", 0.0), 4),
+            "last_price": last,
+            "pnl": round(pnl, 2) if pnl is not None else None,
+            "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
+            "tp_order_id": pos.get("tp_order_id"),
+            "trail_order_id": pos.get("trail_order_id"),
+            "opened_at": pos.get("opened_at"),
+            "has_bracket": bool(pos.get("trail_order_id")),
+        })
+
+    # Try to surface the cached VIX without forcing a fresh fetch
+    try:
+        from ibkr_helpers import _manager as _mgr  # type: ignore
+        vix_level = _mgr.get_vix_cache()
+    except Exception:
+        vix_level = None
+
+    update_dashboard_state(
+        mode="PAPER" if PAPER_MODE else "LIVE",
+        connected=is_connected(),
+        nlv=nlv,
+        cash=cash,
+        day_start_nlv=day_state["start_nlv"],
+        peak_nlv=dd_state["peak_nlv"],
+        day_pnl_pct=day_pnl_pct,
+        day_pnl_dollars=day_pnl_dollars,
+        dd_pct=dd_pct,
+        regime=regime,
+        regime_mult=regime_mult,
+        vix=vix_level,
+        daily_halted=day_state["hit_daily_limit"],
+        max_dd_halted=dd_state["hit_max_dd"],
+        positions=positions_out,
+        universe_size=len(STOCK_UNIVERSE),
+        max_positions=MAX_POSITIONS,
+        last_update=_utc_now_iso(),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -609,6 +792,13 @@ def print_startup_banner():
 def run():
     install_signal_handlers()
     print_startup_banner()
+
+    # Dashboard starts early so /health is reachable even while IBKR warms up
+    if DASHBOARD_ENABLED:
+        try:
+            start_dashboard(DASHBOARD_PORT)
+        except Exception as e:
+            log.warning(f"Could not start dashboard: {e}")
 
     try:
         get_ib()
@@ -640,7 +830,7 @@ def run():
                 get_ib()
 
             print("\n" + "═" * 80)
-            print(f"  🌍 GLOBAL RSI BOT [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"  🌍 GLOBAL RSI BOT v2 [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"  Positions: {len(bot_positions)}/{MAX_POSITIONS}")
             print("═" * 80)
 
@@ -650,8 +840,11 @@ def run():
             unrealized = summary.get("UnrealizedPnL", 0)
             realized = summary.get("RealizedPnL", 0)
 
+            # Day rollover — may send yesterday's Discord summary BEFORE reset
             roll_over_day_if_needed(nlv)
+
             day_pnl_pct = ((nlv - day_state["start_nlv"]) / day_state["start_nlv"] * 100) if day_state["start_nlv"] else 0
+            day_pnl_dollars = nlv - day_state["start_nlv"] if day_state["start_nlv"] else 0
             dd_pct = ((nlv - dd_state["peak_nlv"]) / dd_state["peak_nlv"] * 100) if dd_state["peak_nlv"] else 0
 
             log.info(f"💼 NLV: ${nlv:,.2f} | Cash: ${cash:,.2f} | "
@@ -663,9 +856,19 @@ def run():
             halted_daily = check_daily_loss(nlv)
             halted_dd = check_max_drawdown(nlv)
 
+            # Cache regime (call is cheap — 30 min TTL)
+            try:
+                regime, regime_mult = get_market_regime()
+            except Exception as e:
+                log.warning(f"get_market_regime failed: {e}")
+                regime, regime_mult = "UNKNOWN", 1.0
+
             if bot_positions:
                 dash_contracts = {sym: pos["contract"] for sym, pos in bot_positions.items()}
                 dash_prices = get_prices_batch(dash_contracts)
+                for sym, p in dash_prices.items():
+                    if p is not None:
+                        _last_prices[sym] = p
                 for sym, pos in bot_positions.items():
                     price = dash_prices.get(sym)
                     entry = pos["entry"]
@@ -682,6 +885,14 @@ def run():
 
             if not halted_daily and not halted_dd:
                 scan_all_markets()
+
+            # Push dashboard snapshot after everything is reconciled
+            _push_dashboard_snapshot(
+                nlv=nlv, cash=cash,
+                day_pnl_pct=day_pnl_pct, day_pnl_dollars=day_pnl_dollars,
+                dd_pct=dd_pct,
+                regime=regime, regime_mult=regime_mult,
+            )
 
             save_state()
             print("═" * 80)
