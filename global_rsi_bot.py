@@ -1,6 +1,6 @@
 """
-Global RSI Bot — IBKR (v2)
-=============================
+Global RSI Bot — IBKR (v2.1)
+================================
 Main loop: scan universe → RSI signals → server-side BRACKET orders
 (parent market + OCA TP + trailing stop). State persisted to disk.
 Daily loss limit + max-DD auto-flatten. Bracket re-attachment on restart.
@@ -10,6 +10,15 @@ v2 additions:
   - VIX-aware market regime (via ibkr_helpers.get_market_regime)
   - Daily P&L summary sent to Discord at each day rollover
   - Embedded FastAPI dashboard (port 8000 by default)
+
+v2.1 additions:
+  - Persistent trade_history in bot_state.json (FIFO-trimmed)
+  - Trades recorded on RSI exits AND external/bracket exits
+    (exit price reconstructed from ib.fills() when possible)
+  - Winrate statistics surfaced in /status and daily Discord summary
+    for lifetime / 30d / 7d / 24h
+  - Per-position trail_pct / tp_pct persisted in state for accurate
+    external-close reason inference after restart
 """
 
 import asyncio
@@ -20,8 +29,8 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, date, timezone
-from typing import Dict, Optional
+from datetime import datetime, date, timedelta, timezone
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from config import (
@@ -38,11 +47,11 @@ from config import (
     RATE_LIMIT_PER_SYMBOL, ERROR_RETRY_DELAY,
     REGIME_SIZE_MULTIPLIERS, REATTACH_BRACKETS_ON_RECONCILE,
     PARTIAL_SELL_RECONCILE_WAIT,
-    # v2
     USE_VOL_ADJUSTED_SIZING, VOL_TARGET_ANNUAL,
     VOL_SCALAR_MIN, VOL_SCALAR_MAX,
     DASHBOARD_ENABLED, DASHBOARD_PORT,
     SEND_DAILY_SUMMARY,
+    TRADE_HISTORY_MAX_SIZE,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -53,6 +62,7 @@ from ibkr_helpers import (
     get_prices_batch, is_market_open,
     flatten_all_positions, cancel_open_orders_for,
     attach_bracket_to_existing_position,
+    get_recent_sell_fill,
 )
 from dashboard import start_dashboard, update_dashboard_state
 
@@ -85,6 +95,11 @@ dd_state = {
     "hit_max_dd": False,
 }
 
+# Closed-trade history — persisted to bot_state.json.
+# Each record: {symbol, name, exchange, currency, entry_price, exit_price,
+#               qty, pnl, pnl_pct, opened_at, closed_at, reason}
+trade_history: List[dict] = []
+
 # In-memory cache of last-known prices, used for dashboard + daily summary
 # (so we don't need extra IBKR round-trips to compute exposure).
 _last_prices: Dict[str, float] = {}
@@ -102,6 +117,137 @@ def _today_in_reset_tz() -> date:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TRADE HISTORY / WINRATES
+# ══════════════════════════════════════════════════════════════════════════
+
+def record_closed_trade(symbol: str, pos: dict,
+                        exit_price: float, exit_qty: int,
+                        reason: str) -> Optional[dict]:
+    """
+    Append a closed-trade record to trade_history. Returns the record, or
+    None if the inputs are insufficient (e.g. missing entry price).
+    """
+    entry = float(pos.get("entry") or 0.0)
+    exit_qty = int(exit_qty or 0)
+    try:
+        exit_price = float(exit_price or 0.0)
+    except (TypeError, ValueError):
+        exit_price = 0.0
+
+    if entry <= 0 or exit_qty <= 0 or exit_price <= 0:
+        log.warning(
+            f"record_closed_trade: skipping {symbol} — bad inputs "
+            f"entry={entry} exit={exit_price} qty={exit_qty}"
+        )
+        return None
+
+    pnl = (exit_price - entry) * exit_qty
+    pnl_pct = (exit_price - entry) / entry * 100
+
+    trade = {
+        "symbol": symbol,
+        "name": pos.get("name", ""),
+        "exchange": pos.get("exchange", ""),
+        "currency": pos.get("currency", ""),
+        "entry_price": round(entry, 4),
+        "exit_price": round(exit_price, 4),
+        "qty": exit_qty,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 3),
+        "opened_at": pos.get("opened_at"),
+        "closed_at": _utc_now_iso(),
+        "reason": reason,
+    }
+    trade_history.append(trade)
+
+    # FIFO trim to keep state file bounded
+    overflow = len(trade_history) - TRADE_HISTORY_MAX_SIZE
+    if overflow > 0:
+        del trade_history[:overflow]
+
+    emoji = "✅" if pnl > 0 else ("⚪" if pnl == 0 else "❌")
+    log.info(
+        f"  {emoji} Trade logged: {symbol} {reason} | "
+        f"${entry:.2f}→${exit_price:.2f} x{exit_qty} | "
+        f"P&L ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
+    )
+    return trade
+
+
+def compute_winrates() -> dict:
+    """
+    Winrate = (trades with pnl_pct > 0 / total closed trades) × 100, to 1dp.
+    Returns None for any window with zero trades (JSON-null).
+    """
+    now = datetime.now(timezone.utc)
+
+    def _filter_since(seconds: int) -> List[dict]:
+        cutoff = now - timedelta(seconds=seconds)
+        out = []
+        for t in trade_history:
+            dt = _parse_iso_utc(t.get("closed_at"))
+            if dt and dt >= cutoff:
+                out.append(t)
+        return out
+
+    def _winrate(trades: List[dict]) -> Optional[float]:
+        if not trades:
+            return None
+        wins = sum(1 for t in trades if (t.get("pnl_pct") or 0) > 0)
+        return round(wins / len(trades) * 100, 1)
+
+    lifetime = list(trade_history)
+    past_30 = _filter_since(30 * 86400)
+    past_7 = _filter_since(7 * 86400)
+    past_24h = _filter_since(86400)
+
+    return {
+        "winrates": {
+            "lifetime": _winrate(lifetime),
+            "past_30_days": _winrate(past_30),
+            "past_7_days": _winrate(past_7),
+            "past_24_hours": _winrate(past_24h),
+        },
+        "counts": {
+            "lifetime": len(lifetime),
+            "past_30_days": len(past_30),
+            "past_7_days": len(past_7),
+            "past_24_hours": len(past_24h),
+        },
+    }
+
+
+def _classify_external_close_reason(entry: float, exit_price: float,
+                                    tp_pct: float, trail_pct: float) -> str:
+    """
+    Best-effort inference of why a bracket-exited position closed. We don't
+    know for sure which of the two OCA children filled without crawling fills
+    more aggressively, so we infer from price movement against the configured
+    TP / trail thresholds.
+    """
+    if entry <= 0 or exit_price <= 0:
+        return "bracket_exit"
+    ret = (exit_price - entry) / entry
+    if ret >= tp_pct * 0.95:
+        return "take_profit"
+    if ret <= -trail_pct * 0.5:
+        return "trailing_stop"
+    return "bracket_exit"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -122,6 +268,11 @@ def save_state():
                 "tp_order_id": pos.get("tp_order_id"),
                 "trail_order_id": pos.get("trail_order_id"),
                 "opened_at": pos.get("opened_at"),
+                # v2.1: persist the exit thresholds used at entry so that
+                # external-close reason inference after restart uses the
+                # ACTUAL thresholds rather than current defaults.
+                "trail_pct": pos.get("trail_pct"),
+                "tp_pct": pos.get("tp_pct"),
             }
         payload = {
             "bot_positions": serialisable,
@@ -131,6 +282,7 @@ def save_state():
                 "hit_daily_limit": day_state["hit_daily_limit"],
             },
             "dd_state": dd_state,
+            "trade_history": trade_history,
             "saved_at": _utc_now_iso(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -142,7 +294,7 @@ def save_state():
 
 
 def load_state():
-    global day_state, dd_state
+    global day_state, dd_state, trade_history
     if not os.path.exists(STATE_FILE):
         log.info(f"📂 No prior state file at {STATE_FILE}")
         return
@@ -174,6 +326,9 @@ def load_state():
                 "tp_order_id": pos.get("tp_order_id"),
                 "trail_order_id": pos.get("trail_order_id"),
                 "opened_at": pos.get("opened_at"),
+                # v2.1: restore exit thresholds (backwards-compatible via .get)
+                "trail_pct": pos.get("trail_pct"),
+                "tp_pct": pos.get("tp_pct"),
             }
 
         ds = payload.get("day_state", {})
@@ -186,15 +341,23 @@ def load_state():
         dd_state["peak_nlv"] = dd.get("peak_nlv", 0.0)
         dd_state["hit_max_dd"] = dd.get("hit_max_dd", False)
 
+        loaded_trades = payload.get("trade_history", [])
+        if isinstance(loaded_trades, list):
+            trade_history.clear()
+            trade_history.extend(loaded_trades[-TRADE_HISTORY_MAX_SIZE:])
+
         if dd_state["hit_max_dd"] and RESET_MAX_DD_ON_START:
             log.warning("🟡 RESET_MAX_DD=1 detected — clearing persisted max-DD halt flag")
             dd_state["hit_max_dd"] = False
 
-        log.info(f"📂 Loaded state: {len(bot_positions)} positions | "
-                 f"start NLV ${day_state['start_nlv']:,.2f} | "
-                 f"peak NLV ${dd_state['peak_nlv']:,.2f} | "
-                 f"max_dd_halted={dd_state['hit_max_dd']} | "
-                 f"daily_halted={day_state['hit_daily_limit']}")
+        log.info(
+            f"📂 Loaded state: {len(bot_positions)} positions | "
+            f"{len(trade_history)} historical trades | "
+            f"start NLV ${day_state['start_nlv']:,.2f} | "
+            f"peak NLV ${dd_state['peak_nlv']:,.2f} | "
+            f"max_dd_halted={dd_state['hit_max_dd']} | "
+            f"daily_halted={day_state['hit_daily_limit']}"
+        )
     except Exception as e:
         log.error(f"load_state failed: {e} — starting fresh")
 
@@ -217,6 +380,10 @@ def notify(message: str):
 #  DAILY SUMMARY
 # ══════════════════════════════════════════════════════════════════════════
 
+def _format_wr(val: Optional[float]) -> str:
+    return f"{val}%" if val is not None else "—"
+
+
 def send_daily_summary(current_nlv: float):
     """
     Called at day rollover BEFORE day_state is reset. Uses day_state still
@@ -234,7 +401,6 @@ def send_daily_summary(current_nlv: float):
     peak = dd_state["peak_nlv"]
     dd_pct = ((current_nlv - peak) / peak * 100) if peak > 0 else 0.0
 
-    # Exposure: qty × last-known market price (fallback to entry)
     total_exposure = 0.0
     for sym, pos in bot_positions.items():
         mkt = _last_prices.get(sym) or pos.get("entry", 0.0)
@@ -245,6 +411,17 @@ def send_daily_summary(current_nlv: float):
         regime, _ = get_market_regime()
     except Exception:
         regime = "UNKNOWN"
+
+    try:
+        from ibkr_helpers import _manager as _mgr  # type: ignore
+        vix_level = _mgr.get_vix_cache()
+    except Exception:
+        vix_level = None
+    vix_str = f" | VIX {vix_level:.1f}" if vix_level is not None else ""
+
+    wr = compute_winrates()
+    w = wr["winrates"]
+    c = wr["counts"]
 
     mode = "PAPER" if PAPER_MODE else "LIVE"
     emoji = "📈" if day_pnl_dollars >= 0 else "📉"
@@ -258,11 +435,18 @@ def send_daily_summary(current_nlv: float):
         f"• DD from peak: {dd_pct:+.2f}%{dd_emoji}\n"
         f"• Open positions: {len(bot_positions)}  |  "
         f"Exposure: {exposure_pct:.1f}% of NLV\n"
-        f"• Regime: {regime}"
+        f"• Regime: {regime}{vix_str}\n"
+        f"• Winrate — 24h: {_format_wr(w['past_24_hours'])} ({c['past_24_hours']}) | "
+        f"7d: {_format_wr(w['past_7_days'])} ({c['past_7_days']}) | "
+        f"30d: {_format_wr(w['past_30_days'])} ({c['past_30_days']}) | "
+        f"Lifetime: {_format_wr(w['lifetime'])} ({c['lifetime']})"
     )
     notify(msg)
-    log.info(f"📬 Daily summary sent — {date_str} | PnL {day_pnl_pct:+.2f}% | "
-             f"Pos {len(bot_positions)} | Regime {regime}")
+    log.info(
+        f"📬 Daily summary sent — {date_str} | PnL {day_pnl_pct:+.2f}% | "
+        f"Pos {len(bot_positions)} | Regime {regime} | "
+        f"WR 24h={_format_wr(w['past_24_hours'])}  lifetime={_format_wr(w['lifetime'])}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -272,8 +456,6 @@ def send_daily_summary(current_nlv: float):
 def roll_over_day_if_needed(current_nlv: float):
     today = _today_in_reset_tz()
     if day_state["date"] != today:
-        # Send yesterday's summary BEFORE resetting (so day_state still has
-        # yesterday's start_nlv + date).
         send_daily_summary(current_nlv)
 
         log.info(f"📅 New trading day ({DAILY_RESET_TZ}) — resetting daily tracker. "
@@ -314,8 +496,17 @@ def check_max_drawdown(current_nlv: float) -> bool:
                f"Restart with RESET_MAX_DD=1 to resume.")
         if FLATTEN_ON_MAX_DD:
             try:
+                # Record trades for all open positions BEFORE flattening —
+                # use last known prices as best-effort exit estimates.
+                for sym, pos in list(bot_positions.items()):
+                    exit_px = _last_prices.get(sym) or pos.get("entry", 0.0)
+                    record_closed_trade(
+                        sym, pos, exit_px, int(pos.get("qty", 0)),
+                        "max_dd_flatten"
+                    )
                 flatten_all_positions(reason=f"max_dd_{dd_pct*100:.1f}pct")
                 bot_positions.clear()
+                _last_prices.clear()
             except Exception as e:
                 log.error(f"Flatten failed: {e}")
         save_state()
@@ -386,7 +577,6 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
     if regime_mult < 1.0:
         log.info(f"  ⚠️  {symbol}: regime mult {regime_mult*100:.0f}% → base ${base_amount:.2f}")
 
-    # Apply vol-adjusted sizing on top of base × regime
     amount = _apply_vol_scalar(symbol, base_amount, analysis)
 
     if amount < 10:
@@ -430,6 +620,9 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
         "tp_order_id": result.get("tp_order_id"),
         "trail_order_id": result.get("trail_order_id"),
         "opened_at": _utc_now_iso(),
+        # Stored for external-close reason inference at exit time
+        "trail_pct": trail_pct,
+        "tp_pct": tp_pct,
     }
     _last_prices[symbol] = result["price"]
 
@@ -452,24 +645,64 @@ def _handle_partial_sell_remainder(symbol: str, pos: dict, remaining_qty: int):
     contract = pos["contract"]
     entry = pos["entry"]
     cfg = ASSET_CONFIG.get(symbol, {})
-    trail_pct = cfg.get("trailing_stop", DEFAULT_TRAILING_STOP)
-    tp_pct = cfg.get("take_profit", DEFAULT_TAKE_PROFIT)
+    trail_pct = float(pos.get("trail_pct") or cfg.get("trailing_stop", DEFAULT_TRAILING_STOP))
+    tp_pct = float(pos.get("tp_pct") or cfg.get("take_profit", DEFAULT_TAKE_PROFIT))
     tp_id, trail_id = attach_bracket_to_existing_position(
         contract, remaining_qty, entry, trail_pct, tp_pct
     )
     bot_positions[symbol]["qty"] = remaining_qty
     bot_positions[symbol]["tp_order_id"] = tp_id
     bot_positions[symbol]["trail_order_id"] = trail_id
+    # Preserve the original exit thresholds
+    bot_positions[symbol]["trail_pct"] = trail_pct
+    bot_positions[symbol]["tp_pct"] = tp_pct
+
+
+def _record_external_close(symbol: str, pos: dict,
+                           last_known_price: Optional[float]):
+    """
+    Called when IBKR no longer reports a position we were tracking. Tries
+    to pull the actual exit price from recent fills; falls back to last
+    known market price, then to entry price.
+    """
+    exit_price: Optional[float] = None
+    exit_qty = int(pos.get("qty") or 0)
+    exit_reason = "bracket_exit"
+
+    try:
+        fill = get_recent_sell_fill(pos["contract"], lookback_seconds=86400)
+        if fill:
+            exit_price = fill["price"]
+            if fill.get("qty") and fill["qty"] > 0:
+                exit_qty = min(exit_qty, fill["qty"]) if exit_qty else fill["qty"]
+    except Exception as e:
+        log.warning(f"Fill lookup failed for {symbol}: {e}")
+
+    if exit_price is None:
+        exit_price = last_known_price or pos.get("entry", 0.0)
+        exit_reason = "external_close_estimated"
+
+    entry = float(pos.get("entry") or 0.0)
+    trail_pct = float(pos.get("trail_pct") or ASSET_CONFIG.get(symbol, {}).get("trailing_stop", DEFAULT_TRAILING_STOP))
+    tp_pct = float(pos.get("tp_pct") or ASSET_CONFIG.get(symbol, {}).get("take_profit", DEFAULT_TAKE_PROFIT))
+
+    if exit_reason == "bracket_exit":
+        exit_reason = _classify_external_close_reason(entry, exit_price, tp_pct, trail_pct)
+
+    record_closed_trade(symbol, pos, exit_price, exit_qty, exit_reason)
 
 
 def check_exits():
     ibkr_positions = get_all_positions()
 
+    # Reconcile positions that IBKR no longer reports (bracket filled or
+    # manual close). Record them before popping.
     for symbol in list(bot_positions.keys()):
         if symbol not in ibkr_positions or ibkr_positions[symbol]["qty"] <= 0:
             pos = bot_positions.pop(symbol, None)
-            _last_prices.pop(symbol, None)
+            last_known = _last_prices.pop(symbol, None)
             if pos:
+                _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
                 notify(f"✅ [{mode}] {symbol} closed (bracket exit or manual)")
@@ -517,10 +750,12 @@ def check_exits():
 
             sell_result = sell_stock(contract, qty)
             if sell_result:
-                pnl_est = (price - entry) * qty
+                fill_price = sell_result.get("avg_fill_price") or price
+                filled_qty = int(sell_result.get("filled_qty") or qty)
+                pnl_est = (fill_price - entry) * filled_qty
                 emoji = "✅" if pnl_est >= 0 else "❌"
                 log.info(f"{emoji} SELL {symbol} — RSI overbought {change_pct:+.1f}% "
-                         f"| Entry ${entry:.2f} → ${price:.2f} | Est P&L ${pnl_est:+,.2f}")
+                         f"| Entry ${entry:.2f} → ${fill_price:.2f} | Est P&L ${pnl_est:+,.2f}")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
                 notify(f"{emoji} [{mode}] SELL {symbol} ({pos['name']}) — "
                        f"RSI {analysis['rsi']:.1f} | {change_pct:+.1f}%")
@@ -533,10 +768,19 @@ def check_exits():
                     remaining = None
 
                 if not remaining or remaining["qty"] <= 0:
+                    # Full close — log the whole position as one trade
+                    record_closed_trade(
+                        symbol, pos, fill_price, filled_qty, "rsi_exit"
+                    )
                     bot_positions.pop(symbol, None)
                     _last_prices.pop(symbol, None)
                 else:
                     remaining_qty = int(remaining["qty"])
+                    sold_qty = max(0, int(pos.get("qty", 0)) - remaining_qty)
+                    if sold_qty > 0:
+                        record_closed_trade(
+                            symbol, pos, fill_price, sold_qty, "rsi_exit_partial"
+                        )
                     _handle_partial_sell_remainder(symbol, pos, remaining_qty)
 
                 if STATE_SAVE_ON_EVERY_FILL:
@@ -660,13 +904,13 @@ def reconcile_existing_positions():
             continue
 
         entry = info["avg_cost"]
+        cfg = ASSET_CONFIG.get(sym, {})
+        trail_pct = cfg.get("trailing_stop", DEFAULT_TRAILING_STOP)
+        tp_pct = cfg.get("take_profit", DEFAULT_TAKE_PROFIT)
         tp_id = None
         trail_id = None
 
         if REATTACH_BRACKETS_ON_RECONCILE:
-            cfg = ASSET_CONFIG.get(sym, {})
-            trail_pct = cfg.get("trailing_stop", DEFAULT_TRAILING_STOP)
-            tp_pct = cfg.get("take_profit", DEFAULT_TAKE_PROFIT)
             tp_id, trail_id = attach_bracket_to_existing_position(
                 contract, qty, entry, trail_pct, tp_pct
             )
@@ -679,6 +923,8 @@ def reconcile_existing_positions():
             "tp_order_id": tp_id,
             "trail_order_id": trail_id,
             "opened_at": _utc_now_iso(),
+            "trail_pct": trail_pct,
+            "tp_pct": tp_pct,
         }
         bracket_tag = " 🛡️ bracket attached" if tp_id else " ⚠️  UNPROTECTED"
         log.info(f"   ✅ Claimed {sym}: qty {qty} @ avg ${entry:.2f}{bracket_tag}")
@@ -695,7 +941,7 @@ def install_signal_handlers():
 
 def print_startup_banner():
     mode = "PAPER" if PAPER_MODE else "⚠️  LIVE"
-    log.info(f"🌍 Global RSI Bot v2 — [{mode}]")
+    log.info(f"🌍 Global RSI Bot v2.1 — [{mode}]")
     log.info(f"   Universe : {len(STOCK_UNIVERSE)} stocks across US/ASX/UK/EU/HK/CA/SG")
     log.info(f"   RSI      : oversold={RSI_OVERSOLD} overbought={RSI_OVERBOUGHT} period=14")
     log.info(f"   Filters  : Vol={'ON' if USE_VOLUME_FILTER else 'OFF'} "
@@ -716,6 +962,7 @@ def print_startup_banner():
              f"(flatten={FLATTEN_ON_MAX_DD}) reset_tz={DAILY_RESET_TZ}")
     log.info(f"   Scan     : every {SCAN_INTERVAL_SECS // 60}m")
     log.info(f"   Dashboard: {'ON port '+str(DASHBOARD_PORT) if DASHBOARD_ENABLED else 'OFF'}")
+    log.info(f"   History  : {len(trade_history)} trades loaded (cap {TRADE_HISTORY_MAX_SIZE})")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -756,12 +1003,13 @@ def _push_dashboard_snapshot(
             "has_bracket": bool(pos.get("trail_order_id")),
         })
 
-    # Try to surface the cached VIX without forcing a fresh fetch
     try:
         from ibkr_helpers import _manager as _mgr  # type: ignore
         vix_level = _mgr.get_vix_cache()
     except Exception:
         vix_level = None
+
+    wr = compute_winrates()
 
     update_dashboard_state(
         mode="PAPER" if PAPER_MODE else "LIVE",
@@ -781,6 +1029,8 @@ def _push_dashboard_snapshot(
         positions=positions_out,
         universe_size=len(STOCK_UNIVERSE),
         max_positions=MAX_POSITIONS,
+        winrates=wr["winrates"],
+        trade_counts=wr["counts"],
         last_update=_utc_now_iso(),
     )
 
@@ -791,9 +1041,7 @@ def _push_dashboard_snapshot(
 
 def run():
     install_signal_handlers()
-    print_startup_banner()
 
-    # Dashboard starts early so /health is reachable even while IBKR warms up
     if DASHBOARD_ENABLED:
         try:
             start_dashboard(DASHBOARD_PORT)
@@ -812,6 +1060,7 @@ def run():
     log.info(f"✅ Account | NLV: ${nlv:,.2f} | Cash: ${cash:,.2f}")
 
     load_state()
+    print_startup_banner()
     reconcile_existing_positions()
 
     if day_state["date"] is None:
@@ -830,8 +1079,8 @@ def run():
                 get_ib()
 
             print("\n" + "═" * 80)
-            print(f"  🌍 GLOBAL RSI BOT v2 [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"  Positions: {len(bot_positions)}/{MAX_POSITIONS}")
+            print(f"  🌍 GLOBAL RSI BOT v2.1 [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"  Positions: {len(bot_positions)}/{MAX_POSITIONS}  |  History: {len(trade_history)} trades")
             print("═" * 80)
 
             summary = get_account_summary()
@@ -840,7 +1089,6 @@ def run():
             unrealized = summary.get("UnrealizedPnL", 0)
             realized = summary.get("RealizedPnL", 0)
 
-            # Day rollover — may send yesterday's Discord summary BEFORE reset
             roll_over_day_if_needed(nlv)
 
             day_pnl_pct = ((nlv - day_state["start_nlv"]) / day_state["start_nlv"] * 100) if day_state["start_nlv"] else 0
@@ -856,7 +1104,6 @@ def run():
             halted_daily = check_daily_loss(nlv)
             halted_dd = check_max_drawdown(nlv)
 
-            # Cache regime (call is cheap — 30 min TTL)
             try:
                 regime, regime_mult = get_market_regime()
             except Exception as e:
@@ -886,7 +1133,6 @@ def run():
             if not halted_daily and not halted_dd:
                 scan_all_markets()
 
-            # Push dashboard snapshot after everything is reconciled
             _push_dashboard_snapshot(
                 nlv=nlv, cash=cash,
                 day_pnl_pct=day_pnl_pct, day_pnl_dollars=day_pnl_dollars,

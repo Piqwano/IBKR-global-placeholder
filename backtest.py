@@ -315,7 +315,6 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 if math.isnan(fill_price):
                     continue
                 bt.open_position(sym, pe["exchange"], today, fill_price, pe["amount"], pe["cfg"])
-            # Drop all pending (filled or not) — fresh signals each day
             bt.pending_entries = []
 
         # ── 1. Check exits on open positions ──────────────────────────────
@@ -371,7 +370,6 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
             continue
 
         # ── 4. Scan for entries ───────────────────────────────────────────
-        # Track pending symbols to prevent double-queueing
         pending_symbols = {pe["symbol"] for pe in bt.pending_entries}
 
         for sym, df in data.items():
@@ -432,7 +430,7 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                     "symbol": sym, "exchange": exchange,
                     "amount": amount, "cfg": cfg,
                 })
-                pending_symbols.add(sym)  # prevent double-queueing same symbol this bar
+                pending_symbols.add(sym)
             else:
                 bt.open_position(sym, exchange, today, price, amount, cfg)
 

@@ -87,9 +87,6 @@ REGIME_SIZE_MULTIPLIERS = {
 # where:
 #   annualised_vol = (ATR / price) × sqrt(252)
 #   vol_scalar     = VOL_TARGET_ANNUAL / annualised_vol   (clamped)
-#
-# Low-vol names get boosted (up to 1.8×), high-vol names get shrunk (down
-# to 0.4×).
 
 USE_VOL_ADJUSTED_SIZING = True
 VOL_TARGET_ANNUAL = 0.15            # 15% target annualised per-position vol
@@ -111,20 +108,20 @@ RESET_MAX_DD_ON_START = os.getenv("RESET_MAX_DD", "").lower() in ("1", "true", "
 # ══════════════════════════════════════════════════════════════════════════
 #  MARKET REGIME — SPY + VIX
 # ══════════════════════════════════════════════════════════════════════════
-# Regime determination now uses both SPY trend and VIX level:
+# Regime determination uses both SPY trend and VIX level:
 #
-#   BULL:    SPY > 200MA  AND  VIX < VIX_BULL_MAX              (default <20)
-#   CAUTION: SPY > 200MA  AND  VIX_BULL_MAX ≤ VIX ≤ VIX_CAUTION_MAX_ABOVE_200MA
-#         OR SPY > 200MA  AND  VIX > VIX_CAUTION_MAX_ABOVE_200MA (defensive)
-#         OR SPY ≤ 200MA  AND  VIX < VIX_CAUTION_MAX_BELOW_200MA
-#   BEAR:    SPY ≤ 200MA  AND  VIX ≥ VIX_CAUTION_MAX_BELOW_200MA
+#   BULL:    SPY > 200MA AND VIX < VIX_BULL_MAX                (default <20)
+#   CAUTION: SPY > 200MA AND VIX_BULL_MAX ≤ VIX ≤ VIX_CAUTION_MAX_ABOVE_200MA
+#         OR SPY > 200MA AND VIX > VIX_CAUTION_MAX_ABOVE_200MA (defensive)
+#         OR SPY ≤ 200MA AND VIX < VIX_CAUTION_MAX_BELOW_200MA
+#   BEAR:    SPY ≤ 200MA AND VIX ≥ VIX_CAUTION_MAX_BELOW_200MA
 #
-# If VIX fetch fails (no subscription / API error), falls back to the old
-# SPY-only logic: above 50MA + 200MA → BULL, above 200MA → CAUTION, else BEAR.
+# If VIX fetch fails, falls back to SPY-only:
+#   above 50MA+200MA → BULL, above 200MA → CAUTION, else BEAR.
 
 USE_VIX_IN_REGIME = True
 VIX_BULL_MAX = 20.0                       # BULL ceiling
-VIX_CAUTION_MAX_ABOVE_200MA = 25.0        # SPY up, but CAUTION if VIX ≤ 25
+VIX_CAUTION_MAX_ABOVE_200MA = 25.0        # SPY up, CAUTION if VIX ≤ 25
 VIX_CAUTION_MAX_BELOW_200MA = 22.0        # SPY down, still CAUTION if VIX < 22
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -202,6 +199,11 @@ PARTIAL_SELL_RECONCILE_WAIT = 1.5
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 STATE_SAVE_ON_EVERY_FILL = True
 
+# Cap on the number of closed trades kept in bot_state.json. Older entries
+# are trimmed (FIFO) once the cap is exceeded. Each record is ~300B so 10k
+# keeps the state file well under 5MB.
+TRADE_HISTORY_MAX_SIZE = 10_000
+
 # ══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════
@@ -216,7 +218,6 @@ SEND_DAILY_SUMMARY = True           # Discord summary at each day rollover
 
 DASHBOARD_ENABLED = True
 # Railway sets PORT automatically for web services; fall back to 8000.
-# (Not a new config burden — if PORT isn't set, we just use 8000.)
 DASHBOARD_PORT = int(os.getenv("PORT", "8000"))
 
 # ══════════════════════════════════════════════════════════════════════════

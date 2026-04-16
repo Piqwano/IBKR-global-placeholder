@@ -3,8 +3,8 @@ IBKR Helpers — Connection, Data, Bracket Orders, Regime, Guards
 =================================================================
 Thread-safe connection management, event-driven trade waits with partial-fill
 handling, bracket orders with server-side TP + trailing stop, market-hours
-gating (including lunch breaks), atomic post-fill TP repair, and a
-VIX-aware market regime detector.
+gating (including lunch breaks), atomic post-fill TP repair, VIX-aware
+market regime, and execution lookup for trade-history reconciliation.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import logging
 import math
 import threading
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple, List
 from zoneinfo import ZoneInfo
 
@@ -406,10 +406,7 @@ def analyze(contract) -> Optional[dict]:
     trend_ok = price > ma200
     ma20_ok = price > ma20
 
-    # ATR for stop-loss / ATR-based stops (period=14)
     atr = calc_atr(highs, lows, closes, period=ATR_PERIOD) if len(closes) > ATR_PERIOD else None
-
-    # Separate, longer-window ATR used for vol-adjusted sizing (period=20)
     atr_sizing = (calc_atr(highs, lows, closes, period=ATR_PERIOD_FOR_SIZING)
                   if len(closes) > ATR_PERIOD_FOR_SIZING else None)
 
@@ -430,8 +427,8 @@ def analyze(contract) -> Optional[dict]:
 def get_vix_level() -> Optional[float]:
     """
     Fetch the latest VIX daily close via CBOE index data. Returns None if
-    unavailable (no market-data subscription, weekend, etc.) — callers must
-    fall back to SPY-only logic. Cached for REGIME_CACHE_TTL seconds.
+    unavailable — callers must fall back to SPY-only logic. Cached for
+    REGIME_CACHE_TTL seconds.
     """
     cached = _manager.get_vix_cache()
     if cached is not None:
@@ -513,16 +510,13 @@ def get_market_regime() -> Tuple[str, float]:
         elif above_200 and vix <= VIX_CAUTION_MAX_ABOVE_200MA:
             regime = "CAUTION"
         elif above_200:
-            # SPY up but VIX elevated → defensive caution
-            regime = "CAUTION"
+            regime = "CAUTION"  # SPY up but VIX elevated → defensive
         elif vix < VIX_CAUTION_MAX_BELOW_200MA:
-            # SPY down but VIX tame → still caution, not bear
-            regime = "CAUTION"
+            regime = "CAUTION"  # SPY down but VIX tame → still caution, not bear
         else:
             regime = "BEAR"
         extra = f" | VIX {vix:.2f}"
     else:
-        # Fallback: SPY-only three-tier logic
         if above_200 and price > ma50:
             regime = "BULL"
         elif above_200:
@@ -764,7 +758,6 @@ def buy_stock_bracket(contract: Stock, amount: float,
     parent_trade, tp_trade, trail_trade = result
     filled, filled_qty = _wait_for_fill(parent_trade)
 
-    # Case 1: zero fill
     if not filled and filled_qty == 0:
         reason = parent_trade.log[-1].message if parent_trade.log else "Unknown"
         status = parent_trade.orderStatus.status
@@ -773,7 +766,6 @@ def buy_stock_bracket(contract: Stock, amount: float,
         _safe_cancel(trail_trade)
         return None
 
-    # Case 2: partial fill → resize bracket
     if not filled and filled_qty > 0:
         log.warning(f"⚠️  {contract.symbol} PARTIAL fill {filled_qty}/{qty} — "
                     f"cancelling parent remainder and resizing bracket")
@@ -794,7 +786,6 @@ def buy_stock_bracket(contract: Stock, amount: float,
         tp_order_id = str(new_tp.order.orderId) if new_tp else None
         trail_order_id = str(new_trail.order.orderId) if new_trail else None
 
-    # Case 3: full fill → optionally repair TP price
     else:
         actual_price = parent_trade.orderStatus.avgFillPrice or price
         actual_qty = int(parent_trade.orderStatus.filled or qty)
@@ -883,6 +874,10 @@ def buy_stock(contract: Stock, amount: float, trail_pct: float, tp_pct: float) -
 
 
 def sell_stock(contract: Stock, qty: float) -> Optional[dict]:
+    """
+    Market sell. Returns dict with order_id, filled_qty, requested_qty, and
+    avg_fill_price (used by the main loop to record closed-trade PnL).
+    """
     ib = get_ib()
     qty = int(qty)
     if qty < 1:
@@ -902,12 +897,21 @@ def sell_stock(contract: Stock, qty: float) -> Optional[dict]:
                         f"cancelling remainder")
             _safe_cancel(trade)
 
+        avg_fill_raw = trade.orderStatus.avgFillPrice
+        try:
+            avg_fill = float(avg_fill_raw) if avg_fill_raw else None
+            if avg_fill is not None and avg_fill <= 0:
+                avg_fill = None
+        except (TypeError, ValueError):
+            avg_fill = None
+
         log.info(f"🔴 SELL {contract.symbol:<8} qty:{filled_qty}/{qty} | {contract.exchange} | "
-                 f"Order:{trade.order.orderId} @ ${trade.orderStatus.avgFillPrice}")
+                 f"Order:{trade.order.orderId} @ ${avg_fill_raw}")
         return {
             "order_id": str(trade.order.orderId),
             "filled_qty": filled_qty,
             "requested_qty": qty,
+            "avg_fill_price": avg_fill,
         }
     except Exception as e:
         log.error(f"Sell failed {contract.symbol}: {e}")
@@ -932,6 +936,68 @@ def cancel_all_orders():
         log.warning("🚨 reqGlobalCancel() issued")
     except Exception as e:
         log.error(f"Global cancel failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  EXECUTION LOOKUP — for trade-history reconciliation
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_recent_sell_fill(contract: Stock,
+                         lookback_seconds: int = 86400) -> Optional[dict]:
+    """
+    Find the most recent SELL execution for this contract's conId within
+    the lookback window. Used when a position closes externally (bracket
+    trailing-stop or TP) so we can reconstruct exit price + size for the
+    trade-history log.
+
+    Returns {"price": float, "qty": int, "exec_id": str, "time": datetime}
+    or None if nothing found.
+    """
+    ib = get_ib()
+    try:
+        fills = ib.fills()
+    except Exception as e:
+        log.warning(f"ib.fills() failed for {contract.symbol}: {e}")
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+    matching = []
+    for fill in fills:
+        try:
+            if fill.contract.conId != contract.conId:
+                continue
+            side = getattr(fill.execution, "side", "")
+            if side not in ("SLD", "SELL"):
+                continue
+            exec_time = fill.time
+            if exec_time is None:
+                continue
+            if exec_time.tzinfo is None:
+                exec_time = exec_time.replace(tzinfo=timezone.utc)
+            if exec_time < cutoff:
+                continue
+            matching.append((exec_time, fill))
+        except Exception:
+            continue
+
+    if not matching:
+        return None
+
+    matching.sort(key=lambda x: x[0], reverse=True)
+    exec_time, latest = matching[0]
+    try:
+        price = float(latest.execution.avgPrice or latest.execution.price or 0)
+        qty = int(float(latest.execution.shares or 0))
+    except Exception:
+        return None
+    if price <= 0 or qty <= 0:
+        return None
+    return {
+        "price": price,
+        "qty": qty,
+        "exec_id": latest.execution.execId,
+        "time": exec_time,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════

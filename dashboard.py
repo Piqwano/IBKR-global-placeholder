@@ -5,8 +5,10 @@ Exposes /health, /status, /positions on port DASHBOARD_PORT.
 Runs in a background daemon thread. Reads a thread-safe snapshot of bot
 state that the main loop updates via `update_dashboard_state()`.
 
-Degrades gracefully if fastapi / uvicorn aren't installed: logs a warning
-and returns False from start_dashboard() so the bot keeps running.
+/status includes winrate stats across four time windows:
+  lifetime, past_30_days, past_7_days, past_24_hours.
+
+Degrades gracefully if fastapi / uvicorn aren't installed.
 """
 
 from __future__ import annotations
@@ -51,6 +53,18 @@ _state: Dict[str, Any] = {
     "max_positions": 0,
     "last_update": None,
     "connected": False,
+    "winrates": {
+        "lifetime": None,
+        "past_30_days": None,
+        "past_7_days": None,
+        "past_24_hours": None,
+    },
+    "trade_counts": {
+        "lifetime": 0,
+        "past_30_days": 0,
+        "past_7_days": 0,
+        "past_24_hours": 0,
+    },
 }
 
 
@@ -70,7 +84,7 @@ def _snapshot() -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────
 
 def _build_app():
-    app = FastAPI(title="IBKR Global RSI Bot", version="2.0", docs_url="/docs")
+    app = FastAPI(title="IBKR Global RSI Bot", version="2.1", docs_url="/docs")
 
     @app.get("/health")
     def health():
@@ -102,6 +116,18 @@ def _build_app():
             "vix": s["vix"],
             "daily_halted": s["daily_halted"],
             "max_dd_halted": s["max_dd_halted"],
+            "winrates": s.get("winrates", {
+                "lifetime": None,
+                "past_30_days": None,
+                "past_7_days": None,
+                "past_24_hours": None,
+            }),
+            "trade_counts": s.get("trade_counts", {
+                "lifetime": 0,
+                "past_30_days": 0,
+                "past_7_days": 0,
+                "past_24_hours": 0,
+            }),
             "last_update": s["last_update"],
         }
 
@@ -138,9 +164,6 @@ def start_dashboard(port: int = 8000) -> bool:
 
     def _run():
         try:
-            # Build a Server manually so we can disable signal handlers —
-            # uvicorn tries to install signal handlers from whatever thread
-            # it runs in, but Python only allows that from the main thread.
             config = uvicorn.Config(
                 app, host="0.0.0.0", port=port,
                 log_level="warning", access_log=False,
