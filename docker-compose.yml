@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  # IB Gateway — gnzsnz image auto-calculates socat port as API port + 2
+  #   TRADING_MODE=live  → API port 4001 → socat port 4003
+  #   TRADING_MODE=paper → API port 4002 → socat port 4004
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}          # paper | live
+      TWS_ACCEPT_INCOMING: accept
+      READ_ONLY_API: "no"
+      TIME_ZONE: UTC
+    ports:
+      - "4001:4001"   # live API
+      - "4002:4002"   # paper API
+      - "4003:4003"   # live API via socat
+      - "4004:4004"   # paper API via socat
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "ibgateway"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  rsi-bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      ib-gateway:
+        condition: service_started
+    environment:
+      # Connection
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT: ${IB_GATEWAY_PORT:-4004}     # 4003 live, 4004 paper
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-10}
+
+      # Mode
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      IB_MARKET_DATA: ${IB_MARKET_DATA:-delayed}    # delayed | live
+
+      # Timezone / reset
+      DAILY_RESET_TZ: ${DAILY_RESET_TZ:-America/New_York}
+      RESET_MAX_DD: ${RESET_MAX_DD:-}               # set to 1 to clear persisted halt
+
+      # Notifications
+      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+    volumes:
+      - ./state:/app/state
