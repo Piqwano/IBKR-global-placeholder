@@ -6,8 +6,10 @@ tzdata
 requests>=2.28
 
 # Backtesting
+
 yfinance>=0.2.30
 
 # Dashboard (optional — bot runs without them, logs a warning)
+
 fastapi>=0.110
 uvicorn[standard]>=0.27
