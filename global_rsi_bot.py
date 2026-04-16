@@ -1,34 +1,19 @@
 """
-Global RSI Bot — IBKR (v2.1)
-================================
+Global RSI Bot — IBKR (v2.1 + R-round hardening)
+==================================================
 Main loop: scan universe → RSI signals → server-side BRACKET orders
 (parent market + OCA TP + trailing stop). State persisted to disk.
 Daily loss limit + max-DD auto-flatten. Bracket re-attachment on restart.
 
-v2 additions:
-  - Volatility-adjusted position sizing (ATR-based vol targeting)
-  - VIX-aware market regime (via ibkr_helpers.get_market_regime)
-  - Daily P&L summary sent to Discord at each day rollover
-  - Embedded FastAPI dashboard (port 8000 by default)
-
-v2.1 additions:
-  - Persistent trade_history in bot_state.json (FIFO-trimmed)
-  - Trades recorded on RSI exits AND external/bracket exits
-    (exit price reconstructed from ib.fills() when possible)
-  - Winrate statistics surfaced in /status and daily Discord summary
-    for lifetime / 30d / 7d / 24h
-  - Per-position trail_pct / tp_pct persisted in state for accurate
-    external-close reason inference after restart
-
-v2.1+ hardening (B1–B4 / H1–H4):
-  - Deterministic BASE-currency NLV/cash resolution (B1)
-  - TP repair via in-place order amend — no unprotected window (B2)
-  - Position-aware fill lookup with partial-fill summation (B3)
-  - VIX-unavailable fallback degrades to CAUTION/BEAR only (B4)
-  - Dashboard per-symbol price timestamps + stale flag (H1)
-  - Trade-history NaN/Inf sanitisation + save fallback (H2)
-  - Partial-sell defensive reconciliation w/ arithmetic remainder (H3)
-  - ADOPT_ORPHAN gate for manual/orphan position adoption (H4)
+R-round changes layered on B1–B4 / H1–H4:
+  R1: try_buy() blocks if account_values_healthy() reports False
+  R3: _record_external_close() correct exit_qty clamp on partial fills
+  R5: compute_winrates() single-pass unparseable counting
+  R6: _reconcile_post_sell() prefers arithmetic remainder when IBKR=0
+      but arithmetic says shares remain (conservative)
+  R10: max-DD flatten removes only confirmed-closed positions
+  R13: scan duration logged and surfaced on dashboard
+  Plus Discord non-critical rate-limiting to protect critical alerts.
 """
 
 import asyncio
@@ -39,6 +24,7 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -59,10 +45,11 @@ from config import (
     PARTIAL_SELL_RECONCILE_WAIT,
     USE_VOL_ADJUSTED_SIZING, VOL_TARGET_ANNUAL,
     VOL_SCALAR_MIN, VOL_SCALAR_MAX,
-    DASHBOARD_ENABLED, DASHBOARD_PORT,
+    DASHBOARD_ENABLED, DASHBOARD_PORT, DASHBOARD_HOST, DASHBOARD_AUTH_TOKEN,
     SEND_DAILY_SUMMARY,
     TRADE_HISTORY_MAX_SIZE,
     ADOPT_ORPHAN,
+    DISCORD_NON_CRITICAL_RATE_PER_MIN,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -74,6 +61,7 @@ from ibkr_helpers import (
     flatten_all_positions, cancel_open_orders_for,
     attach_bracket_to_existing_position,
     get_recent_sell_fill,
+    account_values_healthy,
 )
 from dashboard import start_dashboard, update_dashboard_state
 
@@ -106,17 +94,18 @@ dd_state = {
     "hit_max_dd": False,
 }
 
-# Closed-trade history — persisted to bot_state.json.
 trade_history: List[dict] = []
 
-# In-memory cache of last-known prices + per-symbol write timestamps.
-# SAFETY (H1): _last_price_ts keeps the dashboard honest — any shown P&L
-# older than 2× SCAN_INTERVAL_SECS is flagged stale so operator decisions
-# are based on fresh data, not silently cached values.
 _last_prices: Dict[str, float] = {}
 _last_price_ts: Dict[str, str] = {}
 
 _shutdown = False
+
+# Track the last scan duration for dashboard observability (R13)
+_last_scan_duration: Optional[float] = None
+
+# Discord non-critical notify rate-limit (sliding 60s window)
+_discord_non_critical_times: deque = deque()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -144,12 +133,6 @@ def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
 
 
 def _sanitise_float(val, default: float = 0.0) -> float:
-    """
-    SAFETY (H2): Sanitise any float value bound for trade_history / JSON.
-    Rejects NaN and Inf (which serialise to invalid JSON in strict mode and
-    can poison downstream calculations). Returns `default` on bad input so
-    a single weird fill can't corrupt the whole state file.
-    """
     try:
         f = float(val)
     except (TypeError, ValueError):
@@ -160,31 +143,18 @@ def _sanitise_float(val, default: float = 0.0) -> float:
 
 
 def _mark_price(symbol: str, price: Optional[float]):
-    """
-    SAFETY (H1): Centralised price writeback — keeps prices and timestamps
-    in sync. Never bypass this; the dashboard's stale detection depends on
-    every _last_prices write having a matching _last_price_ts entry.
-    """
     if price is not None:
         _last_prices[symbol] = price
         _last_price_ts[symbol] = _utc_now_iso()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TRADE HISTORY / WINRATES  (H2)
+#  TRADE HISTORY
 # ══════════════════════════════════════════════════════════════════════════
 
 def record_closed_trade(symbol: str, pos: dict,
                         exit_price: float, exit_qty: int,
                         reason: str) -> Optional[dict]:
-    """
-    Append a closed-trade record to trade_history. Returns the record, or
-    None if the inputs are insufficient (e.g. missing entry price).
-
-    SAFETY (H2): All numeric inputs sanitised through _sanitise_float so a
-    NaN / Inf from a degenerate fill can't poison the JSON state file or
-    skew winrate calculations.
-    """
     entry = _sanitise_float(pos.get("entry"))
     exit_price = _sanitise_float(exit_price)
     try:
@@ -203,15 +173,12 @@ def record_closed_trade(symbol: str, pos: dict,
     pnl = (exit_price - entry) * exit_qty
     pnl_pct = (exit_price - entry) / entry * 100
 
-    # Double-check derived values are clean
     if math.isnan(pnl) or math.isinf(pnl) or math.isnan(pnl_pct) or math.isinf(pnl_pct):
         log.error(f"record_closed_trade: NaN/Inf in derived values for {symbol} — refusing to record")
         return None
 
     now_iso = _utc_now_iso()
     opened_at = pos.get("opened_at")
-    # Validate opened_at is parseable; if not, fall back to now so the record
-    # at least appears in time-windowed winrates instead of silently dropping.
     if opened_at and _parse_iso_utc(opened_at) is None:
         log.warning(f"record_closed_trade: {symbol} has unparseable opened_at={opened_at!r}; using now")
         opened_at = now_iso
@@ -232,7 +199,6 @@ def record_closed_trade(symbol: str, pos: dict,
     }
     trade_history.append(trade)
 
-    # FIFO trim to keep state file bounded
     overflow = len(trade_history) - TRADE_HISTORY_MAX_SIZE
     if overflow > 0:
         del trade_history[:overflow]
@@ -248,32 +214,33 @@ def record_closed_trade(symbol: str, pos: dict,
 
 def compute_winrates() -> dict:
     """
-    Winrate = (trades with pnl_pct > 0 / total closed trades) × 100, to 1dp.
-    Returns None for any window with zero trades (JSON-null).
-
-    SAFETY (H2):
-      - 'lifetime' counts ALL persisted trades (no timestamp dependency),
-        so a record with an unparseable closed_at still contributes to the
-        lifetime denominator.
-      - Time-windowed (24h/7d/30d) filters drop unparseable records but
-        LOG a warning so data-quality issues surface instead of silently
-        degrading statistics.
+    R5: Single-pass partition of trade_history into parseable vs unparseable.
+    Previously we filtered three times and counted bad records 3x, then
+    divided by 3 — brittle if the number of windows ever changed. Now
+    unparseable records are counted once and the windowed filters operate
+    on a pre-validated list.
     """
     now = datetime.now(timezone.utc)
-    unparseable_count = 0
+    cutoffs = {
+        "past_30_days": now - timedelta(days=30),
+        "past_7_days":  now - timedelta(days=7),
+        "past_24_hours": now - timedelta(hours=24),
+    }
 
-    def _filter_since(seconds: int) -> List[dict]:
-        nonlocal unparseable_count
-        cutoff = now - timedelta(seconds=seconds)
-        out = []
-        for t in trade_history:
-            dt = _parse_iso_utc(t.get("closed_at"))
-            if dt is None:
-                unparseable_count += 1
-                continue
-            if dt >= cutoff:
-                out.append(t)
-        return out
+    parseable: List[tuple] = []      # list of (closed_at_dt, trade_dict)
+    unparseable_count = 0
+    for t in trade_history:
+        dt = _parse_iso_utc(t.get("closed_at"))
+        if dt is None:
+            unparseable_count += 1
+            continue
+        parseable.append((dt, t))
+
+    if unparseable_count > 0:
+        log.warning(
+            f"compute_winrates: {unparseable_count} trade record(s) have unparseable "
+            f"closed_at — excluded from time-windowed stats (lifetime unaffected)"
+        )
 
     def _winrate(trades: List[dict]) -> Optional[float]:
         if not trades:
@@ -281,20 +248,11 @@ def compute_winrates() -> dict:
         wins = sum(1 for t in trades if _sanitise_float(t.get("pnl_pct")) > 0)
         return round(wins / len(trades) * 100, 1)
 
-    # Lifetime uses full list — NEVER drops records for parse failures
+    # Lifetime uses ALL trades (including unparseable closed_at)
     lifetime = list(trade_history)
-    past_30 = _filter_since(30 * 86400)
-    past_7 = _filter_since(7 * 86400)
-    past_24h = _filter_since(86400)
-
-    # unparseable_count gets incremented 3× per bad record (once per window);
-    # divide by 3 for actual count.
-    if unparseable_count > 0:
-        actual = unparseable_count // 3
-        log.warning(
-            f"compute_winrates: {actual} trade record(s) have unparseable "
-            f"closed_at — excluded from time-windowed stats (lifetime unaffected)"
-        )
+    past_30 = [t for dt, t in parseable if dt >= cutoffs["past_30_days"]]
+    past_7 = [t for dt, t in parseable if dt >= cutoffs["past_7_days"]]
+    past_24h = [t for dt, t in parseable if dt >= cutoffs["past_24_hours"]]
 
     return {
         "winrates": {
@@ -314,12 +272,6 @@ def compute_winrates() -> dict:
 
 def _classify_external_close_reason(entry: float, exit_price: float,
                                     tp_pct: float, trail_pct: float) -> str:
-    """
-    Best-effort inference of why a bracket-exited position closed. We don't
-    know for sure which of the two OCA children filled without crawling fills
-    more aggressively, so we infer from price movement vs the configured
-    TP / trail thresholds.
-    """
     if entry <= 0 or exit_price <= 0:
         return "bracket_exit"
     ret = (exit_price - entry) / entry
@@ -331,16 +283,10 @@ def _classify_external_close_reason(entry: float, exit_price: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STATE PERSISTENCE  (H2)
+#  STATE PERSISTENCE
 # ══════════════════════════════════════════════════════════════════════════
 
 def save_state():
-    """
-    SAFETY (H2): Atomic write (.tmp + os.replace). Uses allow_nan=False so a
-    stray NaN/Inf never lands on disk. If trade_history serialisation fails
-    (bad record), falls back to preserving prior on-disk history rather than
-    destroying it — positions path stays functional independently.
-    """
     try:
         serialisable = {}
         for sym, pos in bot_positions.items():
@@ -368,7 +314,6 @@ def save_state():
             "saved_at": _utc_now_iso(),
         }
 
-        # Try full payload first (positions + history)
         try:
             full_payload = {**base_payload, "trade_history": trade_history}
             tmp = STATE_FILE + ".tmp"
@@ -377,17 +322,12 @@ def save_state():
             os.replace(tmp, STATE_FILE)
             return
         except (ValueError, TypeError) as history_err:
-            # Strict JSON serialisation failed — almost certainly a bad
-            # float in trade_history. Fall back to positions-only to protect
-            # the hot recovery path.
             log.error(
                 f"save_state: trade_history serialisation FAILED ({history_err}) — "
                 f"saving positions/state WITHOUT in-memory history this cycle. "
                 f"Investigate trade_history for NaN/Inf entries."
             )
             fallback_payload = {**base_payload, "trade_history": []}
-            # Preserve prior on-disk history if loadable — don't silently
-            # destroy it just because the in-memory list is sick.
             if os.path.exists(STATE_FILE):
                 try:
                     with open(STATE_FILE) as f:
@@ -395,7 +335,7 @@ def save_state():
                     if isinstance(prior.get("trade_history"), list):
                         fallback_payload["trade_history"] = prior["trade_history"]
                 except Exception:
-                    pass  # keep empty list — better than failing save entirely
+                    pass
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(fallback_payload, f, indent=2, allow_nan=False)
@@ -474,17 +414,39 @@ def load_state():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NOTIFICATIONS
+#  NOTIFICATIONS (with rate limit for non-critical)
 # ══════════════════════════════════════════════════════════════════════════
 
-def notify(message: str):
+def notify(message: str, critical: bool = False):
+    """
+    Discord notify with sliding-window rate-limit for non-critical messages.
+    Critical alerts (max-DD, daily-loss, rejected orders) always go through
+    — the rate-limit exists so a cascade of trade notifications can't
+    crowd out the critical "MAX DD HIT" alert the operator actually needs.
+    """
     if not DISCORD_WEBHOOK:
         return
+
+    if not critical:
+        now = time.time()
+        window_start = now - 60
+        while _discord_non_critical_times and _discord_non_critical_times[0] < window_start:
+            _discord_non_critical_times.popleft()
+        if len(_discord_non_critical_times) >= DISCORD_NON_CRITICAL_RATE_PER_MIN:
+            log.warning(
+                f"Discord rate-limit: dropping non-critical notify (>{DISCORD_NON_CRITICAL_RATE_PER_MIN}/min): "
+                f"{message[:80]}..."
+            )
+            return
+        _discord_non_critical_times.append(now)
+
     try:
         import requests
         requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=5)
-    except Exception:
-        pass
+    except Exception as e:
+        # Don't log-spam on webhook failures — just one line
+        if critical:
+            log.error(f"CRITICAL notify failed to send: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -496,14 +458,10 @@ def _format_wr(val: Optional[float]) -> str:
 
 
 def send_daily_summary(current_nlv: float):
-    """
-    Called at day rollover BEFORE day_state is reset. Uses day_state still
-    holding yesterday's values (start_nlv, date).
-    """
     if not SEND_DAILY_SUMMARY or not DISCORD_WEBHOOK:
         return
     if day_state["date"] is None or day_state["start_nlv"] <= 0:
-        return  # first run — nothing to summarise
+        return
 
     start_nlv = day_state["start_nlv"]
     day_pnl_dollars = current_nlv - start_nlv
@@ -552,7 +510,8 @@ def send_daily_summary(current_nlv: float):
         f"30d: {_format_wr(w['past_30_days'])} ({c['past_30_days']}) | "
         f"Lifetime: {_format_wr(w['lifetime'])} ({c['lifetime']})"
     )
-    notify(msg)
+    # Daily summary is operational/critical in nature — bypass rate-limit
+    notify(msg, critical=True)
     log.info(
         f"📬 Daily summary sent — {date_str} | PnL {day_pnl_pct:+.2f}% | "
         f"Pos {len(bot_positions)} | Regime {regime} | "
@@ -561,7 +520,7 @@ def send_daily_summary(current_nlv: float):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DAILY / DRAWDOWN CHECKS
+#  DAILY / DRAWDOWN CHECKS  (R10)
 # ══════════════════════════════════════════════════════════════════════════
 
 def roll_over_day_if_needed(current_nlv: float):
@@ -586,12 +545,22 @@ def check_daily_loss(current_nlv: float) -> bool:
         log.critical(f"🛑 DAILY LOSS LIMIT HIT — {pnl_pct*100:+.2f}% "
                      f"(limit {-DAILY_LOSS_LIMIT_PCT*100:.1f}%) | "
                      f"${day_state['start_nlv']:,.2f} → ${current_nlv:,.2f}")
-        notify(f"🛑 Daily loss limit hit {pnl_pct*100:+.2f}% — halting new buys for today")
+        notify(
+            f"🛑 Daily loss limit hit {pnl_pct*100:+.2f}% — halting new buys for today",
+            critical=True,
+        )
         save_state()
     return day_state["hit_daily_limit"]
 
 
 def check_max_drawdown(current_nlv: float) -> bool:
+    """
+    R10: On max-DD flatten, remove ONLY positions that sell_stock confirmed
+    closed. Previously bot_positions.clear() ran unconditionally, desyncing
+    our state from IBKR if connection dropped mid-flatten. Leftover
+    positions now stay in bot_positions and will be reconciled (either
+    closed normally or surfaced via the orphan path) on the next cycle.
+    """
     if current_nlv > dd_state["peak_nlv"]:
         dd_state["peak_nlv"] = current_nlv
 
@@ -602,26 +571,59 @@ def check_max_drawdown(current_nlv: float) -> bool:
     if dd_pct <= -MAX_DRAWDOWN_PCT and not dd_state["hit_max_dd"]:
         dd_state["hit_max_dd"] = True
         log.critical(f"🛑 MAX DRAWDOWN HIT — {dd_pct*100:+.2f}% from peak ${dd_state['peak_nlv']:,.2f}")
-        notify(f"🛑🛑 MAX DRAWDOWN {dd_pct*100:+.2f}% hit. "
-               f"{'FLATTENING ALL' if FLATTEN_ON_MAX_DD else 'Halting new buys'}. "
-               f"Restart with RESET_MAX_DD=1 to resume.")
+        notify(
+            f"🛑🛑 MAX DRAWDOWN {dd_pct*100:+.2f}% hit. "
+            f"{'FLATTENING ALL' if FLATTEN_ON_MAX_DD else 'Halting new buys'}. "
+            f"Restart with RESET_MAX_DD=1 to resume.",
+            critical=True,
+        )
         if FLATTEN_ON_MAX_DD:
             try:
-                # Record trades for all open positions BEFORE flattening —
-                # use last known prices as best-effort exit estimates.
-                for sym, pos in list(bot_positions.items()):
-                    exit_px = _last_prices.get(sym) or pos.get("entry", 0.0)
-                    record_closed_trade(
-                        sym, pos, exit_px, int(pos.get("qty", 0)),
-                        "max_dd_flatten"
+                # Snapshot symbols we think we hold BEFORE the flatten
+                pre_flatten_symbols = list(bot_positions.keys())
+                outcomes = flatten_all_positions(reason=f"max_dd_{dd_pct*100:.1f}pct")
+
+                # R10: only remove positions that flatten CONFIRMED closed
+                removed = 0
+                left_behind = []
+                for sym in pre_flatten_symbols:
+                    outcome = outcomes.get(sym)
+                    pos = bot_positions.get(sym)
+                    if outcome and outcome.get("success") and outcome.get("filled_qty", 0) > 0:
+                        # Record the trade with real fill price
+                        exit_px = outcome.get("avg_fill_price") or _last_prices.get(sym) or (pos.get("entry") if pos else 0.0)
+                        if pos:
+                            record_closed_trade(
+                                sym, pos, exit_px,
+                                int(outcome.get("filled_qty") or pos.get("qty", 0)),
+                                "max_dd_flatten"
+                            )
+                        bot_positions.pop(sym, None)
+                        _last_prices.pop(sym, None)
+                        _last_price_ts.pop(sym, None)
+                        removed += 1
+                    else:
+                        # Flatten didn't confirm close — keep in bot_positions
+                        # for next-cycle reconciliation. Do NOT record a trade.
+                        left_behind.append(sym)
+
+                if left_behind:
+                    log.critical(
+                        f"🚨 Max-DD flatten INCOMPLETE: {removed}/{len(pre_flatten_symbols)} closed. "
+                        f"Unconfirmed: {left_behind} — kept in state for next-cycle reconcile. "
+                        f"Manual check of IBKR positions required."
                     )
-                flatten_all_positions(reason=f"max_dd_{dd_pct*100:.1f}pct")
-                bot_positions.clear()
-                # SAFETY (H1): clear both price + timestamp caches together
-                _last_prices.clear()
-                _last_price_ts.clear()
+                    notify(
+                        f"🚨 Max-DD flatten INCOMPLETE: {removed}/{len(pre_flatten_symbols)} "
+                        f"closed. Leftover: {', '.join(left_behind)}. Manual check required.",
+                        critical=True,
+                    )
+                else:
+                    log.info(f"✅ Max-DD flatten complete: {removed} positions closed")
+
             except Exception as e:
                 log.error(f"Flatten failed: {e}")
+                notify(f"🚨 Max-DD flatten RAISED EXCEPTION: {e}", critical=True)
         save_state()
     return dd_state["hit_max_dd"]
 
@@ -631,10 +633,6 @@ def check_max_drawdown(current_nlv: float) -> bool:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
-    """
-    Scale a base position amount by target-vol / realised-vol. Returns the
-    adjusted amount. Clamps the scalar to [VOL_SCALAR_MIN, VOL_SCALAR_MAX].
-    """
     if not USE_VOL_ADJUSTED_SIZING:
         return base_amount
 
@@ -643,7 +641,7 @@ def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
     if not atr_sizing or not price or price <= 0:
         return base_amount
 
-    atr_pct = atr_sizing / price                        # daily vol proxy
+    atr_pct = atr_sizing / price
     annualised_vol = atr_pct * math.sqrt(252)
     if annualised_vol <= 0:
         return base_amount
@@ -662,12 +660,20 @@ def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ENTRY
+#  ENTRY  (R1 — account-values health gate)
 # ══════════════════════════════════════════════════════════════════════════
 
 def try_buy(symbol: str, exchange: str, currency: str, name: str,
             analysis: dict, regime_mult: float):
     if day_state["hit_daily_limit"] or dd_state["hit_max_dd"]:
+        return
+
+    # R1: block buys while account-values resolution is degraded. This is
+    # an explicit positive check on top of cash_guard_check's own internal
+    # gate — defence in depth.
+    healthy, reason = account_values_healthy()
+    if not healthy:
+        log.info(f"  🚫 {symbol} skip — account-values unhealthy: {reason}")
         return
 
     open_now, reason = is_market_open(exchange)
@@ -741,8 +747,13 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
     mode = "PAPER" if PAPER_MODE else "LIVE"
     regime_tag = f" [regime {regime_mult*100:.0f}%]" if regime_mult < 1.0 else ""
     bracket_tag = " [bracket]" if USE_BRACKET_ORDERS and result.get("trail_order_id") else ""
-    notify(f"🟢 [{mode}] BUY {symbol} ({name}) @ ${result['price']:.2f} x{result['qty']} "
-           f"| RSI {analysis['rsi']:.1f} | {exchange}{regime_tag}{bracket_tag}")
+    # BUY notifications are non-critical (operational, but losing one
+    # isn't catastrophic — the critical alerts are halts and errors)
+    notify(
+        f"🟢 [{mode}] BUY {symbol} ({name}) @ ${result['price']:.2f} x{result['qty']} "
+        f"| RSI {analysis['rsi']:.1f} | {exchange}{regime_tag}{bracket_tag}",
+        critical=False,
+    )
 
     if STATE_SAVE_ON_EVERY_FILL:
         save_state()
@@ -765,7 +776,6 @@ def _handle_partial_sell_remainder(symbol: str, pos: dict, remaining_qty: int):
     bot_positions[symbol]["qty"] = remaining_qty
     bot_positions[symbol]["tp_order_id"] = tp_id
     bot_positions[symbol]["trail_order_id"] = trail_id
-    # Preserve original exit thresholds
     bot_positions[symbol]["trail_pct"] = trail_pct
     bot_positions[symbol]["tp_pct"] = tp_pct
 
@@ -773,51 +783,71 @@ def _handle_partial_sell_remainder(symbol: str, pos: dict, remaining_qty: int):
 def _reconcile_post_sell(symbol: str, pos: dict,
                          sell_result: dict, price_fallback: float):
     """
-    SAFETY (H3): Post-sell reconciliation with the IBKR position book.
-    Wrapped in try/except to ensure that if get_all_positions() fails
-    (disconnect, timeout, etc.), we still:
-      - use sell_result's filled_qty to compute a best-effort remaining qty
-      - IMMEDIATELY re-attach a bracket to the remainder so we don't leave
-        shares unprotected waiting for the next 15-minute scan cycle.
+    R6: When IBKR reports the position as closed (remaining_qty=0) but
+    arithmetic (orig_qty - filled_qty) says there are shares left, we
+    now PREFER the arithmetic remainder. Previously we trusted IBKR's
+    zero and recorded a full close — which on a race/lag could leave
+    shares in IBKR with no bracket AND no bot tracking.
 
-    Also replaces the blind sleep(1.5) with event-driven polling (200ms)
-    for faster typical completion without reducing worst-case safety.
+    Correct conservative posture: if there's any disagreement and
+    arithmetic says "shares remain", protect them.
     """
     ib = get_ib()
     fill_price = sell_result.get("avg_fill_price") or price_fallback
     filled_qty = int(sell_result.get("filled_qty") or 0)
     orig_qty = int(pos.get("qty", 0))
+    arithmetic_remainder = max(0, orig_qty - filled_qty)
 
-    remaining_qty: Optional[int] = None
+    ibkr_remaining_qty: Optional[int] = None
     try:
-        # Event-driven wait — shorter typical case, same worst case.
         deadline = time.time() + PARTIAL_SELL_RECONCILE_WAIT
         while time.time() < deadline:
             ib.waitOnUpdate(timeout=0.2)
             try:
                 remaining = get_all_positions().get(symbol)
-                remaining_qty = int(remaining["qty"]) if remaining else 0
+                ibkr_remaining_qty = int(remaining["qty"]) if remaining else 0
                 break
             except Exception:
-                # Transient — keep trying until deadline
                 continue
     except Exception as e:
         log.warning(f"Post-sell IBKR position check failed for {symbol}: {e}")
-        remaining_qty = None
+        ibkr_remaining_qty = None
 
-    # If IBKR query failed entirely, fall back to arithmetic.
-    # Defensive: compute max possible remainder so we protect it.
-    if remaining_qty is None:
-        arithmetic_remainder = max(0, orig_qty - filled_qty)
+    # ── R6: arithmetic-preferring reconciliation logic ─────────────────
+    # Decision matrix:
+    #   IBKR=None (query failed)     → use arithmetic (existing H3 behaviour)
+    #   IBKR=0 AND arith=0           → trust, full close
+    #   IBKR=0 AND arith>0           → CONSERVATIVE: assume lag, treat as partial
+    #                                   Protect arith remainder, log loudly
+    #   IBKR>0                       → use IBKR value (authoritative when present)
+    if ibkr_remaining_qty is None:
         log.warning(
-            f"  ⚠️  {symbol}: could not query IBKR positions post-sell; "
-            f"assuming {arithmetic_remainder} shares remain (orig {orig_qty} - filled {filled_qty}). "
-            f"Re-attaching bracket defensively."
+            f"  ⚠️  {symbol}: IBKR position query failed post-sell; "
+            f"using arithmetic remainder {arithmetic_remainder} "
+            f"(orig {orig_qty} - filled {filled_qty})"
         )
         remaining_qty = arithmetic_remainder
+    elif ibkr_remaining_qty == 0 and arithmetic_remainder > 0:
+        # R6: IBKR and arithmetic disagree. IBKR's zero may be a lag
+        # reading the position book just before the partial fill
+        # propagated. Arithmetic has a hard floor — we asked for N,
+        # only M filled, so N-M are still somewhere. Protect them.
+        log.critical(
+            f"🚨 R6: {symbol} IBKR says 0 remaining but arithmetic says {arithmetic_remainder} "
+            f"(orig {orig_qty} - filled {filled_qty}). PREFERRING arithmetic "
+            f"(protect unknown shares, will auto-reconcile next cycle if IBKR later "
+            f"confirms 0)."
+        )
+        notify(
+            f"🚨 {symbol} reconcile disagreement: IBKR=0 vs arith={arithmetic_remainder}. "
+            f"Keeping bracket on arithmetic remainder. Manual check recommended.",
+            critical=True,
+        )
+        remaining_qty = arithmetic_remainder
+    else:
+        remaining_qty = ibkr_remaining_qty
 
     if remaining_qty <= 0:
-        # Full close path
         record_closed_trade(
             symbol, pos, fill_price, filled_qty or orig_qty, "rsi_exit"
         )
@@ -825,7 +855,6 @@ def _reconcile_post_sell(symbol: str, pos: dict,
         _last_prices.pop(symbol, None)
         _last_price_ts.pop(symbol, None)
     else:
-        # Partial close — record what sold, re-attach bracket to remainder
         sold_qty = max(0, orig_qty - remaining_qty)
         if sold_qty > 0:
             record_closed_trade(
@@ -840,18 +869,21 @@ def _reconcile_post_sell(symbol: str, pos: dict,
 def _record_external_close(symbol: str, pos: dict,
                            last_known_price: Optional[float]):
     """
-    Called when IBKR no longer reports a position we were tracking.
+    R3: Fix exit_qty clamp logic. Previously:
+        if exit_qty > 0:
+            exit_qty = min(exit_qty, fill["qty"]) if fill["qty"] < exit_qty else exit_qty
+    reduces to "use fill_qty only if < tracked, else tracked" — missing the
+    case where fill_qty > tracked (state drift from a silent prior partial,
+    or a wider lookback catching an earlier fill even with opened_after).
 
-    SAFETY (B3): Passes pos["opened_at"] as opened_after to
-    get_recent_sell_fill so fills from earlier trades on the same contract
-    can't be attributed to this one, AND all partial fills from this exit
-    are summed into a weighted-average exit price.
+    Correct: clamp to min(tracked, fill_qty) when tracked > 0, and log if
+    fill_qty > tracked so the operator knows about the drift.
     """
     exit_price: Optional[float] = None
     exit_qty = int(pos.get("qty") or 0)
+    tracked_qty = exit_qty
     exit_reason = "bracket_exit"
 
-    # Parse the position's open time — hard lower bound on fills
     opened_after_dt = _parse_iso_utc(pos.get("opened_at"))
 
     try:
@@ -862,13 +894,20 @@ def _record_external_close(symbol: str, pos: dict,
         )
         if fill:
             exit_price = fill["price"]
-            # Cap at tracked qty defensively — never over-attribute shares
-            # to this position if the fill lookup returns more than we held.
-            if fill.get("qty") and fill["qty"] > 0:
-                if exit_qty > 0:
-                    exit_qty = min(exit_qty, fill["qty"]) if fill["qty"] < exit_qty else exit_qty
+            fill_qty = int(fill.get("qty") or 0)
+            if fill_qty > 0:
+                if tracked_qty > 0:
+                    if fill_qty > tracked_qty:
+                        log.warning(
+                            f"⚠️  {symbol} external close: IBKR fill qty {fill_qty} > "
+                            f"tracked qty {tracked_qty} — possible state drift; "
+                            f"clamping to tracked {tracked_qty}"
+                        )
+                    # R3: always clamp to min(tracked, fill)
+                    exit_qty = min(tracked_qty, fill_qty)
                 else:
-                    exit_qty = fill["qty"]
+                    # No tracked qty — trust the fill
+                    exit_qty = fill_qty
     except Exception as e:
         log.warning(f"Fill lookup failed for {symbol}: {e}")
 
@@ -889,8 +928,6 @@ def _record_external_close(symbol: str, pos: dict,
 def check_exits():
     ibkr_positions = get_all_positions()
 
-    # Reconcile positions that IBKR no longer reports (bracket filled or
-    # manual close). Record them before popping.
     for symbol in list(bot_positions.keys()):
         if symbol not in ibkr_positions or ibkr_positions[symbol]["qty"] <= 0:
             pos = bot_positions.pop(symbol, None)
@@ -900,7 +937,7 @@ def check_exits():
                 _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
-                notify(f"✅ [{mode}] {symbol} closed (bracket exit or manual)")
+                notify(f"✅ [{mode}] {symbol} closed (bracket exit or manual)", critical=False)
         elif symbol in ibkr_positions:
             bot_positions[symbol]["qty"] = int(ibkr_positions[symbol]["qty"])
 
@@ -951,17 +988,17 @@ def check_exits():
                 log.info(f"{emoji} SELL {symbol} — RSI overbought {change_pct:+.1f}% "
                          f"| Entry ${entry:.2f} → ${fill_price:.2f} | Est P&L ${pnl_est:+,.2f}")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
-                notify(f"{emoji} [{mode}] SELL {symbol} ({pos['name']}) — "
-                       f"RSI {analysis['rsi']:.1f} | {change_pct:+.1f}%")
+                notify(
+                    f"{emoji} [{mode}] SELL {symbol} ({pos['name']}) — "
+                    f"RSI {analysis['rsi']:.1f} | {change_pct:+.1f}%",
+                    critical=False,
+                )
 
-                # SAFETY (H3): defensive reconciliation — handles IBKR query
-                # failures by falling back to arithmetic remainder and
-                # protecting it immediately.
                 _reconcile_post_sell(symbol, pos, sell_result, price_fallback=price)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SCAN
+#  SCAN  (R13)
 # ══════════════════════════════════════════════════════════════════════════
 
 EXCHANGE_NAMES = {
@@ -972,16 +1009,22 @@ EXCHANGE_NAMES = {
 
 
 def scan_all_markets():
+    global _last_scan_duration
+    scan_start = time.time()
+
     if day_state["hit_daily_limit"]:
         log.info("⏸️  Daily loss limit active — skipping scan")
+        _last_scan_duration = time.time() - scan_start
         return
     if dd_state["hit_max_dd"]:
         log.info("⏸️  Max DD active — skipping scan")
+        _last_scan_duration = time.time() - scan_start
         return
 
     regime, regime_mult = get_market_regime()
     if regime_mult == 0:
         log.info("🔴 BEAR — skipping all buys this cycle")
+        _last_scan_duration = time.time() - scan_start
         return
 
     by_exchange = {}
@@ -1001,6 +1044,7 @@ def scan_all_markets():
 
         for symbol, exch, currency, name in stocks:
             if _shutdown:
+                _last_scan_duration = time.time() - scan_start
                 return
             if symbol in bot_positions:
                 continue
@@ -1046,26 +1090,23 @@ def scan_all_markets():
 
             time.sleep(RATE_LIMIT_PER_SYMBOL)
 
-    log.info(f"\n  Signals: {signals_found} | Positions: {len(bot_positions)}/{MAX_POSITIONS}")
+    duration = time.time() - scan_start
+    _last_scan_duration = duration
+    log.info(f"\n  Signals: {signals_found} | Positions: {len(bot_positions)}/{MAX_POSITIONS} "
+             f"| Scan duration: {duration:.1f}s")
+    # R13: warn if scan is getting close to SCAN_INTERVAL
+    if duration > SCAN_INTERVAL_SECS * 0.5:
+        log.warning(
+            f"⚠️  Scan took {duration:.1f}s ({duration/SCAN_INTERVAL_SECS*100:.0f}% of "
+            f"interval) — consider shrinking universe or increasing SCAN_INTERVAL_SECS"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  STARTUP  (H4)
+#  STARTUP
 # ══════════════════════════════════════════════════════════════════════════
 
 def reconcile_existing_positions():
-    """
-    Reconcile IBKR-reported positions against bot_positions from state.
-
-    SAFETY (H4): Positions present in IBKR but NOT in persisted state are
-    ORPHANS — possibly manual trades, possibly stale state. We do NOT
-    auto-adopt them unless ADOPT_ORPHAN=1 is explicitly set in the env.
-    This prevents the bot from silently taking over a human's mis-click
-    and attaching brackets at its guessed (default) exit percentages.
-
-    Positions already in bot_positions (loaded from state) are handled
-    by the normal check_exits() flow and are not touched here.
-    """
     existing = get_all_positions()
     if not existing:
         return
@@ -1077,7 +1118,7 @@ def reconcile_existing_positions():
 
     for sym, info in existing.items():
         if sym in bot_positions:
-            continue  # already tracked from state
+            continue
 
         qty = int(info["qty"])
         if qty <= 0:
@@ -1089,7 +1130,6 @@ def reconcile_existing_positions():
 
         orphan_count += 1
 
-        # SAFETY (H4): orphan gate
         if not ADOPT_ORPHAN:
             log.warning(
                 f"   🚫 ORPHAN {sym}: qty={qty} @ ${info['avg_cost']:.2f} — "
@@ -1100,7 +1140,6 @@ def reconcile_existing_positions():
             skipped_count += 1
             continue
 
-        # ADOPT_ORPHAN=1 — proceed with adoption + bracket attachment
         _, exch, curr, name = universe_lookup[sym]
 
         contract = get_contract(sym, exch, curr)
@@ -1149,7 +1188,8 @@ def reconcile_existing_positions():
             notify(
                 f"⚠️ [STARTUP] {skipped_count} orphan IBKR position(s) detected "
                 f"but NOT adopted. Review manually. Restart with ADOPT_ORPHAN=1 "
-                f"to claim."
+                f"to claim.",
+                critical=True,
             )
 
 
@@ -1164,7 +1204,7 @@ def install_signal_handlers():
 
 def print_startup_banner():
     mode = "PAPER" if PAPER_MODE else "⚠️  LIVE"
-    log.info(f"🌍 Global RSI Bot v2.1 — [{mode}]")
+    log.info(f"🌍 Global RSI Bot v2.1 + R-hardening — [{mode}]")
     log.info(f"   Universe : {len(STOCK_UNIVERSE)} stocks across US/ASX/UK/EU/HK/CA/SG")
     log.info(f"   RSI      : oversold={RSI_OVERSOLD} overbought={RSI_OVERBOUGHT} period=14")
     log.info(f"   Filters  : Vol={'ON' if USE_VOLUME_FILTER else 'OFF'} "
@@ -1184,13 +1224,14 @@ def print_startup_banner():
              f"MaxDD={MAX_DRAWDOWN_PCT*100:.1f}% "
              f"(flatten={FLATTEN_ON_MAX_DD}) reset_tz={DAILY_RESET_TZ}")
     log.info(f"   Scan     : every {SCAN_INTERVAL_SECS // 60}m")
-    log.info(f"   Dashboard: {'ON port '+str(DASHBOARD_PORT) if DASHBOARD_ENABLED else 'OFF'}")
+    auth_label = "AUTH ✅" if DASHBOARD_AUTH_TOKEN else "⚠️  NO AUTH"
+    log.info(f"   Dashboard: {'ON '+DASHBOARD_HOST+':'+str(DASHBOARD_PORT)+' ['+auth_label+']' if DASHBOARD_ENABLED else 'OFF'}")
     log.info(f"   Orphans  : ADOPT_ORPHAN={'ON — will claim' if ADOPT_ORPHAN else 'OFF — will skip (safe default)'}")
     log.info(f"   History  : {len(trade_history)} trades loaded (cap {TRADE_HISTORY_MAX_SIZE})")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DASHBOARD SNAPSHOT  (H1)
+#  DASHBOARD SNAPSHOT
 # ══════════════════════════════════════════════════════════════════════════
 
 def _push_dashboard_snapshot(
@@ -1199,17 +1240,8 @@ def _push_dashboard_snapshot(
     dd_pct: float,
     regime: str, regime_mult: float,
 ):
-    """
-    Build a JSON-serialisable snapshot and push to dashboard state.
-
-    SAFETY (H1): every position's snapshot now carries last_price_ts,
-    last_price_age_seconds, and a boolean last_price_stale. Operator
-    checking the dashboard during a partial IBKR data outage will see
-    immediately which positions have stale prices, rather than acting on
-    silently-cached hours-old P&L.
-    """
     now_utc = datetime.now(timezone.utc)
-    stale_threshold = timedelta(seconds=SCAN_INTERVAL_SECS * 2)  # 2 scan cycles
+    stale_threshold = timedelta(seconds=SCAN_INTERVAL_SECS * 2)
 
     positions_out = []
     for sym, pos in bot_positions.items():
@@ -1259,6 +1291,7 @@ def _push_dashboard_snapshot(
         vix_level = None
 
     wr = compute_winrates()
+    healthy, health_reason = account_values_healthy()
 
     update_dashboard_state(
         mode="PAPER" if PAPER_MODE else "LIVE",
@@ -1275,11 +1308,14 @@ def _push_dashboard_snapshot(
         vix=vix_level,
         daily_halted=day_state["hit_daily_limit"],
         max_dd_halted=dd_state["hit_max_dd"],
+        account_values_healthy=healthy,
+        account_values_health_reason=health_reason,
         positions=positions_out,
         universe_size=len(STOCK_UNIVERSE),
         max_positions=MAX_POSITIONS,
         winrates=wr["winrates"],
         trade_counts=wr["counts"],
+        last_scan_duration_seconds=_last_scan_duration,
         last_update=_utc_now_iso(),
     )
 
@@ -1293,7 +1329,11 @@ def run():
 
     if DASHBOARD_ENABLED:
         try:
-            start_dashboard(DASHBOARD_PORT)
+            start_dashboard(
+                port=DASHBOARD_PORT,
+                host=DASHBOARD_HOST,
+                auth_token=DASHBOARD_AUTH_TOKEN,
+            )
         except Exception as e:
             log.warning(f"Could not start dashboard: {e}")
 
@@ -1328,7 +1368,7 @@ def run():
                 get_ib()
 
             print("\n" + "═" * 80)
-            print(f"  🌍 GLOBAL RSI BOT v2.1 [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"  🌍 GLOBAL RSI BOT [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"  Positions: {len(bot_positions)}/{MAX_POSITIONS}  |  History: {len(trade_history)} trades")
             print("═" * 80)
 
@@ -1349,6 +1389,10 @@ def run():
                      f"(peak ${dd_state['peak_nlv']:,.2f})")
             if unrealized or realized:
                 log.info(f"   Unrealized: ${unrealized:+,.2f} | Realized: ${realized:+,.2f}")
+
+            healthy, reason = account_values_healthy()
+            if not healthy:
+                log.warning(f"   🚫 Account-values DEGRADED: {reason} — new buys BLOCKED")
 
             halted_daily = check_daily_loss(nlv)
             halted_dd = check_max_drawdown(nlv)

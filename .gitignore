@@ -1,29 +1,41 @@
-# ── secrets & runtime state ──────────────
-.env
-*.env.local
-bot_state.json
-bot_state.json.tmp
-state/
-backtest_trades.csv
-backtest_equity.csv
-
-# ── python ────────────────────────────────
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
 *.egg-info/
+dist/
+build/
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
+.mypy_cache/
 
-# ── venvs ─────────────────────────────────
+# Virtual environments
 venv/
 .venv/
 env/
 
-# ── editors / OS ──────────────────────────
+# Environment files (NEVER commit real secrets)
+.env
+.env.local
+
+# Bot state — contains trade history and current positions
+bot_state.json
+bot_state.json.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
 .vscode/
 .idea/
 *.swp
-.DS_Store
-*.log
+*.swo
+
+# Backtest outputs
+backtest_results/
+*.csv

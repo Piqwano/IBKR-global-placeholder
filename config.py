@@ -34,6 +34,11 @@ RECONNECT_MAX_ATTEMPTS = 0           # 0 = infinite
 CONNECTION_TIMEOUT = 15
 TRADE_FILL_TIMEOUT = 30
 
+# Post-placement verification — poll order status this long (seconds) to
+# confirm a new/amended order actually became active before returning
+# success to the caller. See R9.
+ORDER_PLACEMENT_VERIFY_SECS = 2.0
+
 # ══════════════════════════════════════════════════════════════════════════
 #  STRATEGY — RSI
 # ══════════════════════════════════════════════════════════════════════════
@@ -78,28 +83,19 @@ REGIME_SIZE_MULTIPLIERS = {
 # ══════════════════════════════════════════════════════════════════════════
 #  VOLATILITY-ADJUSTED POSITION SIZING
 # ══════════════════════════════════════════════════════════════════════════
-# Scales each new position by the ratio of target annualised volatility to
-# the stock's own annualised vol (ATR-based). Keeps portfolio-wide vol
-# contribution roughly constant across names of different volatility.
-#
-# Applied AFTER base size × regime multiplier:
-#   final_amount = base_amount × vol_scalar
-# where:
-#   annualised_vol = (ATR / price) × sqrt(252)
-#   vol_scalar     = VOL_TARGET_ANNUAL / annualised_vol   (clamped)
 
 USE_VOL_ADJUSTED_SIZING = True
-VOL_TARGET_ANNUAL = 0.15            # 15% target annualised per-position vol
-ATR_PERIOD_FOR_SIZING = 20          # Separate ATR window for sizing
-VOL_SCALAR_MIN = 0.4                # Floor on vol scalar
-VOL_SCALAR_MAX = 1.8                # Ceiling on vol scalar
+VOL_TARGET_ANNUAL = 0.15
+ATR_PERIOD_FOR_SIZING = 20
+VOL_SCALAR_MIN = 0.4
+VOL_SCALAR_MAX = 1.8
 
 # ══════════════════════════════════════════════════════════════════════════
 #  LOSS LIMITS
 # ══════════════════════════════════════════════════════════════════════════
 
-DAILY_LOSS_LIMIT_PCT = 0.02          # -2% daily → halt new buys
-MAX_DRAWDOWN_PCT = 0.15              # -15% from peak → flatten + halt
+DAILY_LOSS_LIMIT_PCT = 0.02
+MAX_DRAWDOWN_PCT = 0.15
 FLATTEN_ON_MAX_DD = True
 
 DAILY_RESET_TZ = os.getenv("DAILY_RESET_TZ", "America/New_York")
@@ -108,22 +104,11 @@ RESET_MAX_DD_ON_START = os.getenv("RESET_MAX_DD", "").lower() in ("1", "true", "
 # ══════════════════════════════════════════════════════════════════════════
 #  MARKET REGIME — SPY + VIX
 # ══════════════════════════════════════════════════════════════════════════
-# Regime determination uses both SPY trend and VIX level:
-#
-#   BULL:    SPY > 200MA AND VIX < VIX_BULL_MAX                (default <20)
-#   CAUTION: SPY > 200MA AND VIX_BULL_MAX ≤ VIX ≤ VIX_CAUTION_MAX_ABOVE_200MA
-#         OR SPY > 200MA AND VIX > VIX_CAUTION_MAX_ABOVE_200MA (defensive)
-#         OR SPY ≤ 200MA AND VIX < VIX_CAUTION_MAX_BELOW_200MA
-#   BEAR:    SPY ≤ 200MA AND VIX ≥ VIX_CAUTION_MAX_BELOW_200MA
-#
-# SAFETY (B4): If USE_VIX_IN_REGIME=True but VIX fetch fails, the helper
-# degrades to CAUTION/BEAR only — NEVER BULL. Fallback to the SPY-only
-# 3-regime logic happens ONLY when USE_VIX_IN_REGIME=False (explicit opt-out).
 
 USE_VIX_IN_REGIME = True
-VIX_BULL_MAX = 20.0                       # BULL ceiling
-VIX_CAUTION_MAX_ABOVE_200MA = 25.0        # SPY up, CAUTION if VIX ≤ 25
-VIX_CAUTION_MAX_BELOW_200MA = 22.0        # SPY down, still CAUTION if VIX < 22
+VIX_BULL_MAX = 20.0
+VIX_CAUTION_MAX_ABOVE_200MA = 25.0
+VIX_CAUTION_MAX_BELOW_200MA = 22.0
 
 # ══════════════════════════════════════════════════════════════════════════
 #  COMMISSION FILTER
@@ -200,24 +185,12 @@ PARTIAL_SELL_RECONCILE_WAIT = 1.5
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 STATE_SAVE_ON_EVERY_FILL = True
 
-# Cap on the number of closed trades kept in bot_state.json. Older entries
-# are trimmed (FIFO) once the cap is exceeded. Each record is ~300B so 10k
-# keeps the state file well under 5MB.
 TRADE_HISTORY_MAX_SIZE = 10_000
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ORPHAN POSITION ADOPTION
 # ══════════════════════════════════════════════════════════════════════════
-# SAFETY (H4): reconcile_existing_positions() runs on every startup. If the
-# operator manually buys a universe stock (mis-click, testing, external
-# tool), or if the state file is wiped, the bot would previously claim
-# every matching IBKR position and attach brackets using default exit
-# percentages. That's silent auto-management of a human trade.
-#
-# ADOPT_ORPHAN must be explicitly set to "1" for the bot to claim any
-# IBKR position not already in persisted bot_state.json. Default is to
-# SKIP orphans with a loud warning + Discord alert, leaving them alone
-# for the operator.
+
 ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -226,15 +199,32 @@ ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
-SEND_DAILY_SUMMARY = True           # Discord summary at each day rollover
+SEND_DAILY_SUMMARY = True
+
+# Discord rate-limit soft cap: non-critical notifies dropped if this many
+# have been sent in the last 60s. Critical notifies always go through.
+# See R10 (addition).
+DISCORD_NON_CRITICAL_RATE_PER_MIN = 15
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DASHBOARD (FastAPI)
+#  DASHBOARD (FastAPI)  — R11
 # ══════════════════════════════════════════════════════════════════════════
 
 DASHBOARD_ENABLED = True
 # Railway sets PORT automatically for web services; fall back to 8000.
 DASHBOARD_PORT = int(os.getenv("PORT", "8000"))
+
+# R11: Configurable bind address. Default 0.0.0.0 preserves Railway-exposed
+# behaviour. Set to 127.0.0.1 to restrict to loopback only (use when behind
+# a reverse proxy or private network).
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+
+# R11: Auth token. When set, every non-/health endpoint requires the
+# header `X-Auth-Token: <value>`. /health remains unauthenticated so
+# platform health checks (Railway, UptimeRobot) keep working.
+# SAFETY: strongly recommended in production — /positions and /status
+# leak live trading strategy and position details.
+DASHBOARD_AUTH_TOKEN = os.getenv("DASHBOARD_AUTH_TOKEN", "")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  CORRELATION GROUPS

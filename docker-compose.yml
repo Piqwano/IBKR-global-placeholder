@@ -1,26 +1,26 @@
-version: "3.9"
-
 services:
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
-    restart: unless-stopped
     environment:
       TWS_USERID: ${TWS_USERID}
       TWS_PASSWORD: ${TWS_PASSWORD}
       TRADING_MODE: ${TRADING_MODE:-paper}
-      READ_ONLY_API: "no"
+      # Auto-restart gateway weekly to avoid IBKR's forced-logout timer
       TIME_ZONE: UTC
+      TWS_SETTINGS_PATH: /home/ibgateway/Jts
+      READ_ONLY_API: "no"
     ports:
-      - "4001:4001"   # live API (socat)
-      - "4002:4002"   # paper API (socat)
-      - "4003:4003"   # live socat
-      - "4004:4004"   # paper socat
+      # Expose socat ports — paper 4004, live 4003
+      - "4003:4003"
+      - "4004:4004"
+    volumes:
+      - ib-gateway-settings:/home/ibgateway/Jts
+    restart: unless-stopped
 
   rsi-bot:
     build: .
     container_name: rsi-bot
-    restart: unless-stopped
     depends_on:
       - ib-gateway
     environment:
@@ -32,8 +32,18 @@ services:
       DAILY_RESET_TZ: ${DAILY_RESET_TZ:-America/New_York}
       RESET_MAX_DD: ${RESET_MAX_DD:-}
       BOT_STATE_FILE: /app/state/bot_state.json
+      ADOPT_ORPHAN: ${ADOPT_ORPHAN:-}
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+      # Dashboard (R11)
+      PORT: ${PORT:-8000}
+      DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
+      DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:-}
     ports:
-      - "8000:8000"   # dashboard
+      - "8000:8000"
     volumes:
-      - ./state:/app/state
+      - rsi-bot-state:/app/state
+    restart: unless-stopped
+
+volumes:
+  ib-gateway-settings:
+  rsi-bot-state:
