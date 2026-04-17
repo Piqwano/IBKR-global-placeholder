@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import queue
 import signal
 import sys
 import threading
@@ -54,6 +55,7 @@ from config import (
     DISCORD_NON_CRITICAL_RATE_PER_MIN,
     MAX_GROSS_EXPOSURE_PCT,
     STARTUP_SELF_TEST,
+    EXTERNAL_CLOSE_TP_THRESHOLD, EXTERNAL_CLOSE_TRAIL_THRESHOLD,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -61,12 +63,16 @@ from ibkr_helpers import (
     get_market_regime, get_vix_level,
     cash_guard_check, correlation_check,
     buy_stock, sell_stock, get_all_positions, get_account_summary,
-    get_prices_batch, is_market_open,
+    get_prices_batch, is_market_open, get_current_price,
     flatten_all_positions, cancel_open_orders_for,
     attach_bracket_to_existing_position,
+    wait_for_open_orders_stable,
     get_recent_sell_fill,
     account_values_healthy,
     collect_account_summary,
+    get_account_base_currency,
+    convert_from_base, convert_to_base,
+    sanitise_float,
 )
 from dashboard import start_dashboard, update_dashboard_state
 
@@ -118,6 +124,11 @@ _last_scan_duration: Optional[float] = None
 _discord_lock = threading.Lock()
 _discord_non_critical_times: deque = deque()
 
+# H-2: symbols where IBKR-qty-vs-tracked-qty drift has been alerted this
+# session. Reset when the position is fully closed so a later re-buy can
+# alert again if drift recurs.
+_qty_drift_alerted: set = set()
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  TIME / FLOAT HELPERS
@@ -143,14 +154,9 @@ def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _sanitise_float(val, default: float = 0.0) -> float:
-    try:
-        f = float(val)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(f) or math.isinf(f):
-        return default
-    return f
+# L-8: local alias — implementation lives in ibkr_helpers.sanitise_float
+# so the same coercion is shared across the codebase.
+_sanitise_float = sanitise_float
 
 
 def _mark_price(symbol: str, price: Optional[float]):
@@ -285,9 +291,9 @@ def _classify_external_close_reason(entry: float, exit_price: float,
     if entry <= 0 or exit_price <= 0:
         return "bracket_exit"
     ret = (exit_price - entry) / entry
-    if ret >= tp_pct * 0.95:
+    if ret >= tp_pct * EXTERNAL_CLOSE_TP_THRESHOLD:
         return "take_profit"
-    if ret <= -trail_pct * 0.5:
+    if ret <= -trail_pct * EXTERNAL_CLOSE_TRAIL_THRESHOLD:
         return "trailing_stop"
     return "bracket_exit"
 
@@ -427,8 +433,16 @@ def load_state():
                 trade_history.extend(loaded_trades[-TRADE_HISTORY_MAX_SIZE:])
 
             if dd_state["hit_max_dd"] and RESET_MAX_DD_ON_START:
-                log.warning("🟡 RESET_MAX_DD=1 detected — clearing persisted max-DD halt flag")
+                # M-6: also reset peak_nlv. Otherwise the old (higher) peak
+                # persists and the next NLV read trips the halt again before
+                # the operator can intervene. Peak will be re-seeded from
+                # current NLV in run().
+                log.warning(
+                    "🟡 RESET_MAX_DD=1 detected — clearing persisted max-DD halt flag "
+                    "AND peak_nlv (will reseed from current NLV)"
+                )
                 dd_state["hit_max_dd"] = False
+                dd_state["peak_nlv"] = 0.0
 
         log.info(
             f"📂 Loaded state: {len(loaded_positions)} positions | "
@@ -445,6 +459,58 @@ def load_state():
 # ══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════
+
+# M-4: Async Discord delivery. The previous implementation called
+# requests.post synchronously from the main loop with a 5s timeout — a
+# slow/down Discord endpoint could cumulatively stall the scan cycle by
+# tens of seconds. Now notify() enqueues the message and a single daemon
+# worker drains the queue; main loop never blocks on HTTP.
+_notify_queue: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=500)
+_notify_worker_thread: Optional[threading.Thread] = None
+_notify_worker_lock = threading.Lock()
+
+
+def _notify_worker_loop():
+    import requests  # local import so import failure doesn't kill startup
+    while True:
+        item = _notify_queue.get()
+        try:
+            if item is None:
+                return
+            message, critical = item
+            try:
+                requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=5)
+            except Exception as e:
+                if critical:
+                    log.error(f"CRITICAL notify failed to send: {e}")
+                else:
+                    log.warning(f"notify failed: {e}")
+        finally:
+            _notify_queue.task_done()
+
+
+def _ensure_notify_worker():
+    global _notify_worker_thread
+    with _notify_worker_lock:
+        if _notify_worker_thread is None or not _notify_worker_thread.is_alive():
+            _notify_worker_thread = threading.Thread(
+                target=_notify_worker_loop, daemon=True, name="discord-notifier"
+            )
+            _notify_worker_thread.start()
+
+
+def _shutdown_notify_worker(drain_timeout: float = 5.0):
+    """Signal worker to exit after draining current queue."""
+    with _notify_worker_lock:
+        t = _notify_worker_thread
+    if t is None or not t.is_alive():
+        return
+    try:
+        _notify_queue.put_nowait(None)
+    except queue.Full:
+        pass
+    t.join(timeout=drain_timeout)
+
 
 def notify(message: str, critical: bool = False):
     if not DISCORD_WEBHOOK:
@@ -464,12 +530,16 @@ def notify(message: str, critical: bool = False):
                 return
             _discord_non_critical_times.append(now)
 
+    _ensure_notify_worker()
     try:
-        import requests
-        requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=5)
-    except Exception as e:
+        _notify_queue.put_nowait((message, critical))
+    except queue.Full:
+        # Queue is hard-capped so an upstream outage can't consume unbounded
+        # memory. Drop with a log — critical notifies still log even if drop.
         if critical:
-            log.error(f"CRITICAL notify failed to send: {e}")
+            log.error(f"CRITICAL notify DROPPED (queue full): {message[:120]}")
+        else:
+            log.warning(f"notify queue full — dropping: {message[:80]}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -667,6 +737,60 @@ def check_max_drawdown(current_nlv: float) -> bool:
                             _last_prices.pop(sym, None)
                             _last_price_ts.pop(sym, None)
                         removed += 1
+                    elif outcome.get("partial") and pos is not None:
+                        # H-5: partial flatten fill — record the filled portion,
+                        # keep remainder tracked, re-attach bracket so the
+                        # unsold shares are not left unprotected after the
+                        # global-cancel issued by flatten_all_positions.
+                        filled_qty = int(outcome.get("filled_qty") or 0)
+                        remaining_qty = int(outcome.get("remaining_qty") or 0)
+                        exit_px = (outcome.get("avg_fill_price")
+                                   or _last_prices.get(sym)
+                                   or pos.get("entry") or 0.0)
+                        if filled_qty > 0:
+                            record_closed_trade(
+                                sym, pos, exit_px, filled_qty, "max_dd_flatten_partial"
+                            )
+
+                        contract = outcome.get("contract") or pos.get("contract")
+                        entry = pos.get("entry") or 0.0
+                        trail_pct = float(
+                            pos.get("trail_pct")
+                            or ASSET_CONFIG.get(sym, {}).get("trailing_stop", DEFAULT_TRAILING_STOP)
+                        )
+                        tp_pct = float(
+                            pos.get("tp_pct")
+                            or ASSET_CONFIG.get(sym, {}).get("take_profit", DEFAULT_TAKE_PROFIT)
+                        )
+                        tp_id = trail_id = None
+                        if contract and remaining_qty > 0 and entry > 0:
+                            try:
+                                tp_id, trail_id = attach_bracket_to_existing_position(
+                                    contract, remaining_qty, entry, trail_pct, tp_pct
+                                )
+                            except Exception as e:
+                                log.critical(
+                                    f"🚨 {sym} max-DD partial: bracket re-attach FAILED: {e}"
+                                )
+
+                        with _state_lock:
+                            if sym in bot_positions:
+                                bot_positions[sym]["qty"] = remaining_qty
+                                bot_positions[sym]["tp_order_id"] = tp_id
+                                bot_positions[sym]["trail_order_id"] = trail_id
+
+                        log.critical(
+                            f"🚨 {sym} max-DD flatten PARTIAL: closed {filled_qty}, "
+                            f"remaining {remaining_qty} re-bracketed "
+                            f"(tp={bool(tp_id)}, trail={bool(trail_id)})"
+                        )
+                        notify(
+                            f"🚨 {sym} max-DD flatten partial: {filled_qty} closed, "
+                            f"{remaining_qty} remain. Bracket re-attach "
+                            f"{'OK' if (tp_id and trail_id) else 'FAILED'}. Manual check.",
+                            critical=True,
+                        )
+                        left_behind.append(sym)
                     else:
                         left_behind.append(sym)
 
@@ -691,6 +815,46 @@ def check_max_drawdown(current_nlv: float) -> bool:
         save_state()
         return True
     return already_hit
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GROSS EXPOSURE  (H-1)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _current_gross_exposure_base() -> float:
+    """
+    Sum of (qty × mark-price) across all tracked positions, converted to the
+    account base currency. Used to enforce MAX_GROSS_EXPOSURE_PCT in try_buy.
+
+    Graceful degradation: if a position's FX rate can't be resolved, that
+    position's contribution is skipped with a warning. The ceiling becomes
+    soft in that case; cash_guard_check remains the hard gate.
+    """
+    with _state_lock:
+        positions_snapshot = [(sym, dict(pos)) for sym, pos in bot_positions.items()]
+        last_prices_snapshot = dict(_last_prices)
+
+    total_base = 0.0
+    for sym, pos in positions_snapshot:
+        qty = pos.get("qty", 0) or 0
+        if qty <= 0:
+            continue
+        ccy = pos.get("currency") or ""
+        mark = last_prices_snapshot.get(sym)
+        if not mark:
+            mark = pos.get("entry") or 0.0
+        if mark <= 0:
+            continue
+        notional_native = qty * mark
+        notional_base = convert_to_base(notional_native, ccy)
+        if notional_base is None:
+            log.warning(
+                f"  💱 gross-exposure: FX {ccy}->base unresolved for {sym} — "
+                f"skipping its contribution (exposure may be understated)"
+            )
+            continue
+        total_base += notional_base
+    return total_base
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -758,19 +922,32 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
     if portfolio <= 0:
         return
 
+    # All of these are in BASE currency (NLV denomination).
     base_amount = round(portfolio * POSITION_SIZE_PCT * regime_mult, 2)
     if regime_mult < 1.0:
         log.info(f"  ⚠️  {symbol}: regime mult {regime_mult*100:.0f}% → base ${base_amount:.2f}")
 
-    amount = _apply_vol_scalar(symbol, base_amount, analysis)
+    amount_base = _apply_vol_scalar(symbol, base_amount, analysis)
 
-    if amount < 10:
-        log.warning(f"  {symbol}: Position too small after sizing (${amount:.2f})")
+    if amount_base < 10:
+        log.warning(f"  {symbol}: Position too small after sizing (${amount_base:.2f})")
+        return
+
+    # H-1: MAX_GROSS_EXPOSURE_PCT ceiling — block new buys that would push
+    # total gross exposure over the configured cap. All values in BASE ccy.
+    projected_exposure_base = _current_gross_exposure_base() + amount_base
+    exposure_cap_base = portfolio * MAX_GROSS_EXPOSURE_PCT
+    if projected_exposure_base > exposure_cap_base:
+        log.info(
+            f"  🚫 {symbol} skip — gross exposure ceiling "
+            f"(${projected_exposure_base:,.0f} > ${exposure_cap_base:,.0f} "
+            f"= {MAX_GROSS_EXPOSURE_PCT*100:.0f}% of NLV)"
+        )
         return
 
     if not PAPER_MODE:
         est_commission = EXCHANGE_COMMISSIONS.get(exchange, 10.0)
-        commission_pct = est_commission / amount if amount > 0 else 1.0
+        commission_pct = est_commission / amount_base if amount_base > 0 else 1.0
         if commission_pct > MAX_COMMISSION_PCT:
             min_portfolio = est_commission / MAX_COMMISSION_PCT / POSITION_SIZE_PCT
             log.info(f"  💸 {symbol} ({exchange}): ${est_commission:.0f} fee = "
@@ -781,6 +958,22 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
     if not contract:
         return
 
+    # C-1: Convert sizing amount from BASE currency to contract native ccy.
+    # Without this, buying a non-USD stock with a USD-derived amount under/
+    # over-invests by the FX ratio.
+    amount_native = convert_from_base(amount_base, currency)
+    if amount_native is None or amount_native <= 0:
+        log.warning(
+            f"  🚫 {symbol} skip — FX conversion {get_account_base_currency()}"
+            f"->{currency} unavailable; cannot size safely"
+        )
+        return
+    if currency != get_account_base_currency():
+        log.info(
+            f"  💱 {symbol}: ${amount_base:.2f} {get_account_base_currency()} "
+            f"→ {amount_native:.2f} {currency}"
+        )
+
     cfg = ASSET_CONFIG.get(symbol, {})
     trail_pct = cfg.get("trailing_stop", DEFAULT_TRAILING_STOP)
     tp_pct = cfg.get("take_profit", DEFAULT_TAKE_PROFIT)
@@ -790,7 +983,7 @@ def try_buy(symbol: str, exchange: str, currency: str, name: str,
         trail_pct = max(trail_pct, atr_stop_pct)
         log.info(f"  📏 {symbol}: ATR stop = {atr_stop_pct*100:.2f}% → using {trail_pct*100:.2f}%")
 
-    result = buy_stock(contract, amount, trail_pct, tp_pct)
+    result = buy_stock(contract, amount_native, trail_pct, tp_pct)
     if not result:
         return
 
@@ -1004,10 +1197,19 @@ def _record_external_close(symbol: str, pos: dict,
             if fill_qty > 0:
                 if tracked_qty > 0:
                     if fill_qty > tracked_qty:
-                        log.warning(
-                            f"⚠️  {symbol} external close: IBKR fill qty {fill_qty} > "
-                            f"tracked qty {tracked_qty} — possible state drift; "
+                        # M-10: drift indicates a real state-vs-broker
+                        # mismatch. The log.warning alone easily gets lost;
+                        # operator needs a real-time alert.
+                        log.critical(
+                            f"🚨 {symbol} external close: IBKR fill qty {fill_qty} > "
+                            f"tracked qty {tracked_qty} — STATE DRIFT; "
                             f"clamping to tracked {tracked_qty}"
+                        )
+                        notify(
+                            f"🚨 {symbol} fill-qty drift: IBKR closed {fill_qty} vs "
+                            f"tracked {tracked_qty}. Clamped record to tracked. "
+                            f"Manual check recommended.",
+                            critical=True,
                         )
                     exit_qty = min(tracked_qty, fill_qty)
                 else:
@@ -1041,15 +1243,47 @@ def check_exits():
                 pos = bot_positions.pop(symbol, None)
                 last_known = _last_prices.pop(symbol, None)
                 _last_price_ts.pop(symbol, None)
+            _qty_drift_alerted.discard(symbol)  # H-2: reset so next cycle can re-alert
             if pos:
                 _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
                 mode = "PAPER" if PAPER_MODE else "LIVE"
                 notify(f"✅ [{mode}] {symbol} closed (bracket exit or manual)", critical=False)
         elif symbol in ibkr_positions:
+            # H-2: don't blindly overwrite tracked qty. Adopt IBKR's value only
+            # when it's lower (external close / external sell). A higher IBKR
+            # qty indicates drift (manual add, reconcile race) — alert once
+            # per session and KEEP tracked qty rather than silently adopting.
+            ibkr_qty = int(ibkr_positions[symbol]["qty"])
+            drift_up = False
             with _state_lock:
-                if symbol in bot_positions:
-                    bot_positions[symbol]["qty"] = int(ibkr_positions[symbol]["qty"])
+                if symbol not in bot_positions:
+                    continue
+                tracked_qty = int(bot_positions[symbol].get("qty", 0) or 0)
+                if ibkr_qty < tracked_qty:
+                    bot_positions[symbol]["qty"] = ibkr_qty
+                elif ibkr_qty > tracked_qty:
+                    drift_up = True
+                # else: aligned, no-op
+
+            if ibkr_qty < tracked_qty:
+                log.warning(
+                    f"  ⚠️  {symbol}: IBKR qty {ibkr_qty} < tracked {tracked_qty} — "
+                    f"external close detected; aligning tracked qty down"
+                )
+            elif drift_up:
+                log.critical(
+                    f"🚨 {symbol}: IBKR qty {ibkr_qty} > tracked {tracked_qty} — "
+                    f"drift (manual add or reconcile race). KEEPING tracked qty. "
+                    f"Manual inspection required."
+                )
+                if symbol not in _qty_drift_alerted:
+                    _qty_drift_alerted.add(symbol)
+                    notify(
+                        f"🚨 {symbol} qty drift: IBKR {ibkr_qty} > tracked {tracked_qty}. "
+                        f"Keeping tracked qty. Investigate.",
+                        critical=True,
+                    )
 
     with _state_lock:
         if not bot_positions:
@@ -1128,6 +1362,45 @@ def check_exits():
                 )
 
                 _reconcile_post_sell(symbol, pos_snapshot, sell_result, price_fallback=price)
+            else:
+                # C-2: sell failed after we cancelled the protective bracket
+                # above — position is currently UNPROTECTED. Re-attach a fresh
+                # bracket before returning so we don't run bare until next cycle.
+                cfg = ASSET_CONFIG.get(symbol, {})
+                trail_pct = float(
+                    pos_snapshot.get("trail_pct")
+                    or cfg.get("trailing_stop", DEFAULT_TRAILING_STOP)
+                )
+                tp_pct = float(
+                    pos_snapshot.get("tp_pct")
+                    or cfg.get("take_profit", DEFAULT_TAKE_PROFIT)
+                )
+                log.critical(
+                    f"🚨 {symbol} RSI-exit SELL FAILED after bracket cancel — "
+                    f"re-attaching fresh bracket to avoid unprotected window"
+                )
+                try:
+                    tp_id, trail_id = attach_bracket_to_existing_position(
+                        contract, qty, entry, trail_pct, tp_pct
+                    )
+                except Exception as e:
+                    log.critical(
+                        f"🚨 {symbol}: re-attach ALSO failed after sell failure: {e}. "
+                        f"Position is UNPROTECTED until next cycle."
+                    )
+                    tp_id, trail_id = (None, None)
+
+                with _state_lock:
+                    if symbol in bot_positions:
+                        bot_positions[symbol]["tp_order_id"] = tp_id
+                        bot_positions[symbol]["trail_order_id"] = trail_id
+
+                notify(
+                    f"🚨 {symbol} RSI-exit SELL failed — "
+                    f"{'bracket re-attached' if (tp_id and trail_id) else 'UNPROTECTED'}. "
+                    f"Manual check recommended.",
+                    critical=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1169,8 +1442,14 @@ def scan_all_markets():
         by_exchange.setdefault(exch, []).append((sym, exch, curr, name))
 
     signals_found = 0
+    # M-8: reaching MAX_POSITIONS inside the inner loop previously `break`ed
+    # only out of the per-exchange loop; the outer loop then wasted cycles
+    # printing headers for remaining exchanges. This flag early-exits both.
+    positions_full = False
 
     for exchange, stocks in by_exchange.items():
+        if positions_full:
+            break
         open_now, reason = is_market_open(exchange)
         status = "OPEN" if open_now else "CLOSED"
         log.info(f"\n  ── {EXCHANGE_NAMES.get(exchange, exchange)} ({len(stocks)} stocks) [{status}] ──")
@@ -1188,6 +1467,7 @@ def scan_all_markets():
                     continue
                 pos_count = len(bot_positions)
             if pos_count >= MAX_POSITIONS:
+                positions_full = True
                 break
 
             contract = get_contract(symbol, exch, currency)
@@ -1250,6 +1530,13 @@ def reconcile_existing_positions():
     existing = get_all_positions()
     if not existing:
         return
+
+    # H-8: wait for open-orders stream to stabilize before querying
+    # protective-order composition. Otherwise prior-session GTC orders
+    # that haven't streamed in yet are invisible → duplicate bracket attach.
+    open_count = wait_for_open_orders_stable(max_wait=10.0, stable_secs=2.0)
+    log.info(f"   🛡️  Open-orders stream stabilized at {open_count} order(s) before reconcile")
+
     universe_lookup = {s: (s, e, c, n) for s, e, c, n in STOCK_UNIVERSE}
 
     orphan_count = 0
@@ -1298,6 +1585,19 @@ def reconcile_existing_positions():
         tp_id = None
         trail_id = None
 
+        # H-7: orphan may already be in-the-money; anchoring peak = entry
+        # misclassifies subsequent bracket exits and under-represents DD.
+        # Seed peak with max(entry, current_price) so the trailing reference
+        # is at least as good as the current quote at adoption time.
+        peak_init = entry
+        try:
+            mkt = get_current_price(contract)
+            if mkt and mkt > entry:
+                peak_init = mkt
+                _mark_price(sym, mkt)
+        except Exception as e:
+            log.warning(f"   orphan {sym}: could not fetch mkt price for peak seed: {e}")
+
         if REATTACH_BRACKETS_ON_RECONCILE:
             # C4/M8: attach_bracket_to_existing_position now checks for
             # half-protection and cancels-before-replace if needed
@@ -1307,7 +1607,7 @@ def reconcile_existing_positions():
 
         with _state_lock:
             bot_positions[sym] = {
-                "entry": entry, "peak": entry,
+                "entry": entry, "peak": peak_init,
                 "contract": contract,
                 "exchange": exch, "currency": curr, "name": name,
                 "qty": qty,
@@ -1436,14 +1736,19 @@ def _startup_self_test() -> bool:
         log.info(f"  ✅ All {qualified_count} exchanges have at least one qualifying contract")
 
     # 6. State directory writable
+    # M-11: previously wrote to STATE_FILE + ".selftest" which could be in
+    # cwd if STATE_FILE was a bare filename and the process ran in a dir
+    # different to the state dir. Compute the real state-file directory so
+    # the self-test verifies the RIGHT location.
     try:
-        tmp = STATE_FILE + ".selftest"
+        state_dir = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+        tmp = os.path.join(state_dir, ".bot_state_selftest.tmp")
         with open(tmp, "w") as f:
             f.write("selftest\n")
         os.remove(tmp)
-        log.info(f"  ✅ State file path writable: {STATE_FILE}")
+        log.info(f"  ✅ State dir writable: {state_dir}")
     except Exception as e:
-        log.critical(f"  ❌ State file path NOT writable: {e}")
+        log.critical(f"  ❌ State dir NOT writable: {e}")
         checks_passed = False
 
     # 7. Live mode sanity — refuse to run live with NO auth token
@@ -1461,6 +1766,21 @@ def _startup_self_test() -> bool:
             "(no protective orders in simple mode)"
         )
         checks_passed = False
+
+    # 9. L-6: Discord webhook format check (soft). Malformed webhooks silently
+    # 404 per-post and operators miss critical alerts.
+    if DISCORD_WEBHOOK:
+        if not DISCORD_WEBHOOK.startswith(("https://discord.com/api/webhooks/",
+                                            "https://discordapp.com/api/webhooks/")):
+            log.warning(
+                "  ⚠️  DISCORD_WEBHOOK does not look like a Discord webhook URL "
+                "(expected https://discord.com/api/webhooks/...) — notifications "
+                "will silently fail"
+            )
+        else:
+            log.info("  ✅ DISCORD_WEBHOOK format looks valid")
+    else:
+        log.info("  ℹ️  DISCORD_WEBHOOK not set — notifications disabled")
 
     if checks_passed:
         log.info("🧪 ✅ Startup self-test PASSED")
@@ -1490,8 +1810,8 @@ def print_startup_banner():
     log.info(f"   Exits    : Trail={DEFAULT_TRAILING_STOP*100:.0f}% "
              f"TP={DEFAULT_TAKE_PROFIT*100:.0f}% + RSI≥{RSI_OVERBOUGHT}")
     log.info(f"   Brackets : {'✅ server-side OCA' if USE_BRACKET_ORDERS else '❌ polling (UNSAFE)'}")
-    if not USE_BRACKET_ORDERS:
-        log.critical("   ⚠️  USE_BRACKET_ORDERS=False — positions will have NO protection!")
+    # L-3: Duplicate bracket-off warning removed — _startup_self_test already
+    # hard-aborts live startup when USE_BRACKET_ORDERS=False.
     log.info(f"   ATR stops: {'ON ('+str(ATR_MULTIPLIER)+'×ATR)' if USE_ATR_STOPS else 'OFF'}")
     log.info(f"   Sizing   : base {POSITION_SIZE_PCT*100:.0f}% × regime"
              f"{' × vol-scalar ['+str(VOL_SCALAR_MIN)+'–'+str(VOL_SCALAR_MAX)+']' if USE_VOL_ADJUSTED_SIZING else ''}"
@@ -1666,13 +1986,14 @@ def run():
                 log.warning("Not connected — get_ib() will reconnect")
                 get_ib()
 
-            print("\n" + "═" * 80)
+            # L-7: use log.info so structured log ingestion sees these lines.
             with _state_lock:
                 pos_count = len(bot_positions)
                 history_count = len(trade_history)
-            print(f"  🌍 GLOBAL RSI BOT [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"  Positions: {pos_count}/{MAX_POSITIONS}  |  History: {history_count} trades")
-            print("═" * 80)
+            log.info("═" * 80)
+            log.info(f"  🌍 GLOBAL RSI BOT [{mode}] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            log.info(f"  Positions: {pos_count}/{MAX_POSITIONS}  |  History: {history_count} trades")
+            log.info("═" * 80)
 
             summary = get_account_summary()
             nlv = summary.get("NetLiquidation", 0)
@@ -1746,7 +2067,7 @@ def run():
             )
 
             save_state()
-            print("═" * 80)
+            log.info("═" * 80)
             log.info(f"⏳ Next scan in {SCAN_INTERVAL_SECS // 60} min...")
 
             for _ in range(SCAN_INTERVAL_SECS):
@@ -1772,6 +2093,7 @@ def run():
     log.info("👋 Shutting down — saving state and disconnecting")
     save_state()
     disconnect()
+    _shutdown_notify_worker()
 
 
 if __name__ == "__main__":

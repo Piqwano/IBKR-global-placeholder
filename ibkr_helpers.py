@@ -38,7 +38,7 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from ib_insync import IB, Stock, Index, MarketOrder, LimitOrder, Order, Trade, util
+from ib_insync import IB, Stock, Index, Forex, MarketOrder, LimitOrder, Order, Trade, util
 
 from config import (
     IB_HOST, IB_PORT, IB_CLIENT_ID,
@@ -56,9 +56,38 @@ from config import (
     USE_VIX_IN_REGIME,
     VIX_BULL_MAX, VIX_CAUTION_MAX_ABOVE_200MA, VIX_CAUTION_MAX_BELOW_200MA,
     ORDER_PLACEMENT_VERIFY_SECS,
+    FX_CACHE_TTL, FX_SNAPSHOT_WAIT,
 )
 
 log = logging.getLogger("ibkr-rsi")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NUMERIC COERCION HELPERS  (L-8)
+# ══════════════════════════════════════════════════════════════════════════
+
+def sanitise_float(val, default: float = 0.0) -> float:
+    """Coerce to float; on NaN/Inf/parse-failure return `default`."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def sanitise_price(val) -> Optional[float]:
+    """Strict positive-price coercion: None on bad/zero/negative/NaN/Inf."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f) or f <= 0:
+        return None
+    return f
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -208,7 +237,10 @@ class IBConnectionManager:
         self._regime_cache: Optional[Tuple[str, float]] = None
         self._regime_time: float = 0.0
         self._vix_cache: Optional[Tuple[float, float]] = None
-        self._connected = False
+        # FX rate cache: (from_ccy, to_ccy) -> (rate, time)
+        self._fx_cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        # Account base currency — resolved once per session from accountSummary
+        self._base_currency: Optional[str] = None
         self._disconnect_handler_registered = False
 
     def _ensure_loop(self):
@@ -253,7 +285,6 @@ class IBConnectionManager:
 
                 accounts = self._ib.managedAccounts()
                 log.info(f"✅ Connected | Accounts: {accounts} | Market data: {data_label}")
-                self._connected = True
 
                 # R12: clear ALL caches that could carry stale state across
                 # a reconnect. VIX uses its own TTL now (M7) but the cache
@@ -262,7 +293,9 @@ class IBConnectionManager:
                 self._regime_cache = None
                 self._regime_time = 0.0
                 self._vix_cache = None
-                log.info("   Caches cleared: contracts, regime, VIX")
+                self._fx_cache.clear()
+                self._base_currency = None
+                log.info("   Caches cleared: contracts, regime, VIX, FX, base-ccy")
                 return
 
             except Exception as e:
@@ -283,8 +316,6 @@ class IBConnectionManager:
 
     def _on_disconnect(self):
         log.warning("⚠️  IBKR disconnected — will reconnect on next API call")
-        with self._lock:
-            self._connected = False
 
     def _on_connect(self):
         log.info("🔗 IBKR connection established")
@@ -298,7 +329,6 @@ class IBConnectionManager:
             if self._ib and self._ib.isConnected():
                 self._ib.disconnect()
                 log.info("Disconnected from IBKR")
-            self._connected = False
 
     def get_cached_contract(self, key: str) -> Optional[Stock]:
         with self._lock:
@@ -330,6 +360,25 @@ class IBConnectionManager:
     def set_vix_cache(self, level: float):
         with self._lock:
             self._vix_cache = (level, _time.time())
+
+    def get_fx_cache(self, from_ccy: str, to_ccy: str) -> Optional[float]:
+        with self._lock:
+            hit = self._fx_cache.get((from_ccy, to_ccy))
+            if hit and (_time.time() - hit[1]) < FX_CACHE_TTL:
+                return hit[0]
+            return None
+
+    def set_fx_cache(self, from_ccy: str, to_ccy: str, rate: float):
+        with self._lock:
+            self._fx_cache[(from_ccy, to_ccy)] = (rate, _time.time())
+
+    def get_base_currency_cached(self) -> Optional[str]:
+        with self._lock:
+            return self._base_currency
+
+    def set_base_currency(self, ccy: str):
+        with self._lock:
+            self._base_currency = ccy
 
 
 _manager = IBConnectionManager()
@@ -468,12 +517,22 @@ def _extract_price(ticker) -> Optional[float]:
 
 
 def get_current_price(contract: Stock) -> Optional[float]:
+    """
+    M-1: On delayed data (free tier), MARKET_DATA_SNAPSHOT_WAIT=3s is often
+    not enough for the snapshot to populate. A silent None here causes the
+    buy signal to be dropped entirely. We now retry the wait once before
+    giving up.
+    """
     ib = get_ib()
     ticker = None
     try:
         ticker = ib.reqMktData(contract, "", True, False)
         ib.sleep(MARKET_DATA_SNAPSHOT_WAIT)
         price = _extract_price(ticker)
+        if price is None:
+            # One extra wait window — delayed snapshots often need it
+            ib.sleep(MARKET_DATA_SNAPSHOT_WAIT)
+            price = _extract_price(ticker)
         return round(price, 4) if price else None
     except Exception as e:
         log.warning(f"Price error {contract.symbol}: {e}")
@@ -624,6 +683,179 @@ def get_vix_level() -> Optional[float]:
     except Exception as e:
         log.warning(f"VIX fetch failed: {e} — regime will degrade per B4 policy")
         return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FX — ACCOUNT BASE CURRENCY + RATES (C-1)
+# ══════════════════════════════════════════════════════════════════════════
+# Position sizing is expressed as a percent of NLV. NLV is denominated in the
+# account BASE currency (typically USD). Without FX conversion, sizing an AUD
+# stock against a USD NLV budget mis-sizes by the FX ratio. These helpers
+# resolve the base currency once per session and the pair rates with a short
+# TTL.
+
+_FX_STALE_WARN_LEVEL = 0.0  # last warn-price guard (unused; placeholder)
+
+
+def get_account_base_currency() -> str:
+    """
+    Resolve account base currency. IBKR's accountSummary returns each tag
+    with `currency="BASE"` plus a matching row with the real currency code.
+    We compare values across the two rows: whichever non-BASE currency has
+    the same value as BASE is the account's base currency.
+
+    Cached for the session. Falls back to "USD" if resolution fails.
+    """
+    cached = _manager.get_base_currency_cached()
+    if cached:
+        return cached
+
+    ib = get_ib()
+    try:
+        vals = ib.accountSummary()
+    except Exception as e:
+        log.warning(f"get_account_base_currency: accountSummary failed ({e}) — defaulting USD")
+        _manager.set_base_currency("USD")
+        return "USD"
+
+    # Gather NLV rows
+    base_val: Optional[float] = None
+    candidates: Dict[str, float] = {}
+    for item in vals:
+        if item.tag != "NetLiquidation":
+            continue
+        try:
+            v = float(item.value)
+        except (TypeError, ValueError):
+            continue
+        if item.currency == "BASE":
+            base_val = v
+        else:
+            candidates[item.currency] = v
+
+    if base_val is None or not candidates:
+        log.warning("get_account_base_currency: no BASE/currency pair in NLV — defaulting USD")
+        _manager.set_base_currency("USD")
+        return "USD"
+
+    # Pick the currency whose value matches BASE (within rounding)
+    best_ccy = None
+    best_diff = float("inf")
+    for ccy, v in candidates.items():
+        diff = abs(v - base_val)
+        if diff < best_diff:
+            best_diff = diff
+            best_ccy = ccy
+
+    # Accept if within 0.5% of BASE
+    if best_ccy and base_val > 0 and best_diff / base_val < 0.005:
+        log.info(f"💱 Account base currency detected: {best_ccy}")
+        _manager.set_base_currency(best_ccy)
+        return best_ccy
+
+    log.warning(
+        f"get_account_base_currency: no row matched BASE NLV={base_val} "
+        f"(candidates={candidates}) — defaulting USD"
+    )
+    _manager.set_base_currency("USD")
+    return "USD"
+
+
+def _fetch_fx_rate_once(from_ccy: str, to_ccy: str) -> Optional[float]:
+    """One-shot fetch of an FX rate via a Forex contract snapshot."""
+    ib = get_ib()
+    # ib_insync Forex pairs are expressed as BASEQUOTE (e.g. AUDUSD = how
+    # many USD per 1 AUD). We try BASEQUOTE first, then invert.
+    pair_symbol = f"{from_ccy}{to_ccy}"
+    qualified_contract = None
+    ticker = None
+    try:
+        pair = Forex(pair_symbol)
+        qualified = ib.qualifyContracts(pair)
+        if not qualified:
+            return None
+        qualified_contract = qualified[0]
+        ticker = ib.reqMktData(qualified_contract, "", True, False)
+        ib.sleep(FX_SNAPSHOT_WAIT)
+        price: Optional[float] = None
+        for attr in ("last", "close", "marketPrice"):
+            v = getattr(ticker, attr, None)
+            if callable(v):
+                try:
+                    v = v()
+                except Exception:
+                    v = None
+            if _valid_price(v):
+                price = float(v)
+                break
+        if price is None:
+            bid = getattr(ticker, "bid", None)
+            ask = getattr(ticker, "ask", None)
+            if _valid_price(bid) and _valid_price(ask):
+                price = (float(bid) + float(ask)) / 2
+        return price
+    except Exception as e:
+        log.warning(f"FX fetch {pair_symbol} failed: {e}")
+        return None
+    finally:
+        if qualified_contract is not None:
+            try:
+                ib.cancelMktData(qualified_contract)
+            except Exception:
+                pass
+
+
+def get_fx_rate(from_ccy: str, to_ccy: str) -> Optional[float]:
+    """
+    Return the FX rate converting 1 unit of from_ccy into to_ccy.
+    Cached with FX_CACHE_TTL. Returns None if the pair can't be resolved —
+    caller must treat None as "cannot size this trade safely".
+    """
+    if not from_ccy or not to_ccy:
+        return None
+    if from_ccy == to_ccy:
+        return 1.0
+
+    hit = _manager.get_fx_cache(from_ccy, to_ccy)
+    if hit is not None:
+        return hit
+
+    # Try direct
+    direct = _fetch_fx_rate_once(from_ccy, to_ccy)
+    if direct is not None and direct > 0:
+        _manager.set_fx_cache(from_ccy, to_ccy, direct)
+        # Also cache inverse for free
+        _manager.set_fx_cache(to_ccy, from_ccy, 1.0 / direct)
+        return direct
+
+    # Try inverse
+    inverse = _fetch_fx_rate_once(to_ccy, from_ccy)
+    if inverse is not None and inverse > 0:
+        rate = 1.0 / inverse
+        _manager.set_fx_cache(from_ccy, to_ccy, rate)
+        _manager.set_fx_cache(to_ccy, from_ccy, inverse)
+        return rate
+
+    log.warning(f"FX rate {from_ccy}->{to_ccy} unresolved")
+    return None
+
+
+def convert_to_base(amount: float, from_ccy: str) -> Optional[float]:
+    """Convert `amount` in from_ccy to the account base currency."""
+    base = get_account_base_currency()
+    rate = get_fx_rate(from_ccy, base)
+    if rate is None:
+        return None
+    return amount * rate
+
+
+def convert_from_base(amount_base: float, to_ccy: str) -> Optional[float]:
+    """Convert `amount_base` in account base currency to to_ccy."""
+    base = get_account_base_currency()
+    rate = get_fx_rate(base, to_ccy)
+    if rate is None:
+        return None
+    return amount_base * rate
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -885,6 +1117,41 @@ def _verify_order_live(trade: Trade, timeout: float = ORDER_PLACEMENT_VERIFY_SEC
     return False
 
 
+def _verify_order_cancelled(trade: Trade, timeout: float = ORDER_PLACEMENT_VERIFY_SECS,
+                            label: str = "") -> bool:
+    """
+    H-3: After _safe_cancel, confirm the order actually reached a terminal
+    dead state. `_safe_cancel` swallows all exceptions, so a silently-failed
+    cancel can leave a child bracket alive — e.g., after a verify-failed
+    child placement we'd think we'd cleaned up and return (None, None), but
+    a live orphan SELL could still fire.
+
+    Returns True only if status ∈ {Cancelled, ApiCancelled, Inactive,
+    PendingCancel, Filled} within `timeout`. Filled is accepted because a
+    filled order is also no longer live and cannot cause double-quote.
+    """
+    if trade is None or trade.order is None:
+        return True  # nothing to verify
+    ib = get_ib()
+    deadline = _time.time() + timeout
+    terminal = _TERMINAL_DEAD_STATUSES | {"Filled"}
+    sym = getattr(trade.contract, "symbol", "?")
+    oid = trade.order.orderId
+    tag = f"{label or 'cancel'} {sym}#{oid}"
+
+    while _time.time() < deadline:
+        status = trade.orderStatus.status or ""
+        if status in terminal:
+            return True
+        ib.waitOnUpdate(timeout=0.2)
+
+    log.critical(
+        f"🚨 {tag} did not reach terminal status within {timeout}s "
+        f"(last status: {trade.orderStatus.status!r}) — order MAY STILL BE LIVE"
+    )
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  TP AMEND  (B2 + R2)
 # ══════════════════════════════════════════════════════════════════════════
@@ -957,10 +1224,20 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
                 f"(tp_ok={tp_ok}, trail_ok={trail_ok}) — cancelling both to avoid "
                 f"ambiguous state"
             )
+            # H-3: verify cancels actually stuck. A silently-failed cancel
+            # here leaves an orphan SELL that can fire later as a surprise.
             if tp_trade is not None:
                 _safe_cancel(tp_trade)
             if trail_trade is not None:
                 _safe_cancel(trail_trade)
+            tp_dead = _verify_order_cancelled(tp_trade, label="child TP cancel")
+            trail_dead = _verify_order_cancelled(trail_trade, label="child trail cancel")
+            if not (tp_dead and trail_dead):
+                log.critical(
+                    f"🚨 {contract.symbol}: child cancel verification FAILED "
+                    f"(tp_dead={tp_dead}, trail_dead={trail_dead}). Possible "
+                    f"orphan SELL order live — operator must inspect."
+                )
             return None, None
         return tp_trade, trail_trade
     except Exception as e:
@@ -969,6 +1246,13 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
             _safe_cancel(tp_trade)
         if trail_trade is not None:
             _safe_cancel(trail_trade)
+        tp_dead = _verify_order_cancelled(tp_trade, label="child TP cancel") if tp_trade else True
+        trail_dead = _verify_order_cancelled(trail_trade, label="child trail cancel") if trail_trade else True
+        if not (tp_dead and trail_dead):
+            log.critical(
+                f"🚨 {contract.symbol}: exception-path cancel verification FAILED "
+                f"(tp_dead={tp_dead}, trail_dead={trail_dead}) — orphan SELL risk"
+            )
         return None, None
 
 
@@ -1205,16 +1489,11 @@ def sell_stock(contract: Stock, qty: float) -> Optional[dict]:
                         f"cancelling remainder")
             _safe_cancel(trade)
 
-        avg_fill_raw = trade.orderStatus.avgFillPrice
-        try:
-            avg_fill = float(avg_fill_raw) if avg_fill_raw else None
-            if avg_fill is not None and avg_fill <= 0:
-                avg_fill = None
-        except (TypeError, ValueError):
-            avg_fill = None
+        avg_fill = sanitise_price(trade.orderStatus.avgFillPrice)
 
+        avg_fill_display = f"${avg_fill:.4f}" if avg_fill is not None else "N/A"
         log.info(f"🔴 SELL {contract.symbol:<8} qty:{filled_qty}/{qty} | {contract.exchange} | "
-                 f"Order:{trade.order.orderId} @ ${avg_fill_raw}")
+                 f"Order:{trade.order.orderId} @ {avg_fill_display}")
         return {
             "order_id": str(trade.order.orderId),
             "filled_qty": filled_qty,
@@ -1330,6 +1609,44 @@ def get_recent_sell_fill(contract: Stock,
 # ══════════════════════════════════════════════════════════════════════════
 #  BRACKET RE-ATTACHMENT  (R8 + C4/M8)
 # ══════════════════════════════════════════════════════════════════════════
+
+def wait_for_open_orders_stable(max_wait: float = 10.0,
+                                stable_secs: float = 2.0) -> int:
+    """
+    H-8: After (re)connect, GTC orders from prior sessions take time to
+    flow back into ib_insync's openTrades() list. reconcile_existing_positions
+    calls has_protective_orders → inspect_protective_orders → ib.openTrades()
+    and will falsely report "no protection" until the broker finishes
+    registering those orders, triggering a DUPLICATE bracket attach.
+
+    This helper polls ib.openTrades() until the count has been stable for
+    `stable_secs` seconds (or max_wait elapsed) and returns the final count.
+    Call once before startup reconcile; not needed mid-loop.
+    """
+    ib = get_ib()
+    deadline = _time.time() + max_wait
+    last_count = -1
+    stable_since = _time.time()
+    # Proactively ask the broker to re-send open orders — ib_insync does
+    # this via reqAutoOpenOrders on connect, but an explicit nudge is cheap.
+    try:
+        ib.reqAllOpenOrders()
+    except Exception as e:
+        log.warning(f"reqAllOpenOrders nudge failed (non-fatal): {e}")
+    while _time.time() < deadline:
+        ib.waitOnUpdate(timeout=0.5)
+        try:
+            count = len(ib.openTrades())
+        except Exception:
+            count = last_count
+        if count == last_count:
+            if _time.time() - stable_since >= stable_secs:
+                return count
+        else:
+            last_count = count
+            stable_since = _time.time()
+    return last_count if last_count >= 0 else 0
+
 
 def inspect_protective_orders(contract: Stock) -> dict:
     """
@@ -1483,26 +1800,40 @@ def flatten_all_positions(reason: str = "emergency") -> Dict[str, dict]:
             cancel_open_orders_for(contract)
             result = sell_stock(contract, qty)
             if result and result.get("filled_qty", 0) > 0:
+                filled = int(result.get("filled_qty") or 0)
+                requested = int(result.get("requested_qty") or qty)
+                # H-5: make partial-vs-full distinction explicit so the caller
+                # can re-attach a bracket to the remainder instead of losing
+                # track of unprotected shares.
                 outcomes[sym] = {
-                    "success": True,
-                    "filled_qty": int(result.get("filled_qty") or 0),
-                    "requested_qty": int(result.get("requested_qty") or qty),
+                    "success": filled >= requested,
+                    "partial": 0 < filled < requested,
+                    "filled_qty": filled,
+                    "requested_qty": requested,
+                    "remaining_qty": max(0, requested - filled),
                     "avg_fill_price": result.get("avg_fill_price"),
+                    "contract": contract,
                 }
             else:
                 outcomes[sym] = {
                     "success": False,
+                    "partial": False,
                     "filled_qty": 0,
                     "requested_qty": qty,
+                    "remaining_qty": qty,
                     "avg_fill_price": None,
+                    "contract": contract,
                 }
         except Exception as e:
             log.error(f"Flatten failed for {sym}: {e}")
             outcomes[sym] = {
                 "success": False,
+                "partial": False,
                 "filled_qty": 0,
                 "requested_qty": qty,
+                "remaining_qty": qty,
                 "avg_fill_price": None,
+                "contract": contract,
                 "error": str(e),
             }
     return outcomes
