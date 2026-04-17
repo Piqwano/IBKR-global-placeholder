@@ -1802,6 +1802,29 @@ def _startup_self_test() -> bool:
         )
         checks_passed = False
 
+    # 11. Cash-reserve + gross-exposure mutual-satisfiability invariant
+    # (external-review follow-up). A buy must satisfy BOTH:
+    #   - gross exposure ≤ MAX_GROSS_EXPOSURE_PCT * NLV
+    #   - cash ≥ CASH_RESERVE_PCT * NLV
+    # Gross + cash ≤ NLV (ignoring margin), so the policy is only coherent
+    # when CASH_RESERVE_PCT + MAX_GROSS_EXPOSURE_PCT ≤ 1.0. If a future
+    # edit drifts these apart (e.g. cash=0.25, gross=0.80 = 1.05), the
+    # bot silently can't deploy its full budget. Hard-fail at startup.
+    invariant = CASH_RESERVE_PCT + MAX_GROSS_EXPOSURE_PCT
+    if invariant > 1.0 + 1e-9:
+        log.critical(
+            f"  ❌ CASH_RESERVE_PCT ({CASH_RESERVE_PCT:.2f}) + "
+            f"MAX_GROSS_EXPOSURE_PCT ({MAX_GROSS_EXPOSURE_PCT:.2f}) = "
+            f"{invariant:.2f} > 1.00 — mutually unsatisfiable. "
+            f"Reduce one to keep the sum ≤ 1.0."
+        )
+        checks_passed = False
+    else:
+        log.info(
+            f"  ✅ Cash+exposure invariant: {CASH_RESERVE_PCT:.2f} + "
+            f"{MAX_GROSS_EXPOSURE_PCT:.2f} = {invariant:.2f} ≤ 1.00"
+        )
+
     # 10. DAILY_RESET_TZ parseable via ZoneInfo (external-review follow-up).
     # _today_in_reset_tz() calls ZoneInfo(DAILY_RESET_TZ) every cycle; a typo
     # would raise ZoneInfoNotFoundError mid-loop on the first day-roll, not
