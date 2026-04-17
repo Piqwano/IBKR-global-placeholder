@@ -1,45 +1,45 @@
 """
-Dashboard — Tiny FastAPI status server
-========================================
-Exposes /health, /status, /positions on DASHBOARD_PORT.
-Runs in a background daemon thread. Reads a thread-safe snapshot of bot
-state that the main loop updates via `update_dashboard_state()`.
+Dashboard — FastAPI read-only observability (v2.3)
+====================================================
+Serves a snapshot of bot state via HTTP for operator visibility.
 
-R-round additions:
-  R4: /status exposes `stale_position_count` (top-level) for at-a-glance
-      detection of data outages.
-  R11: Configurable bind host (DASHBOARD_HOST) and optional header-token
-       auth (DASHBOARD_AUTH_TOKEN) for /status, /positions, /docs. /health
-       stays unauthenticated for platform health checks.
+Endpoints:
+  GET /health      — unauthenticated, for platform liveness checks
+  GET /status      — auth-required (if DASHBOARD_AUTH_TOKEN set), JSON summary
+  GET /positions   — auth-required, open positions snapshot
+  GET /winrates    — auth-required, winrates + counts
+  GET /trades      — auth-required, recent closed trades (last 200)
+
+v2.3:
+  - Bind host configurable (DASHBOARD_HOST)
+  - Auth token enforced on all endpoints except /health
+  - State is updated atomically via update_dashboard_state()
+  - Running on a separate thread so main-loop I/O never blocks on HTTP
 """
 
-from __future__ import annotations
-
-import hmac
 import logging
 import threading
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+try:
+    from fastapi import FastAPI, Header, HTTPException, status
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    _FASTAPI_AVAILABLE = True
+except ImportError:
+    _FASTAPI_AVAILABLE = False
 
 log = logging.getLogger("ibkr-rsi")
 
-try:
-    from fastapi import FastAPI, Header, HTTPException, Request
-    from fastapi.responses import JSONResponse
-    import uvicorn
-    _FASTAPI_OK = True
-except ImportError:
-    _FASTAPI_OK = False
-    FastAPI = None        # type: ignore
-    uvicorn = None        # type: ignore
+# ══════════════════════════════════════════════════════════════════════════
+#  SHARED STATE  (updated by main loop, read by HTTP handlers)
+# ══════════════════════════════════════════════════════════════════════════
 
-
-# ──────────────────────────────────────────────────────────────────────────
-#  SHARED STATE
-# ──────────────────────────────────────────────────────────────────────────
-
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()
 _state: Dict[str, Any] = {
-    "mode": "PAPER",
+    "mode": "UNKNOWN",
+    "connected": False,
     "nlv": 0.0,
     "cash": 0.0,
     "day_start_nlv": 0.0,
@@ -57,27 +57,30 @@ _state: Dict[str, Any] = {
     "positions": [],
     "universe_size": 0,
     "max_positions": 0,
-    "last_update": None,
-    "connected": False,
+    "winrates": {},
+    "trade_counts": {},
     "last_scan_duration_seconds": None,
-    "winrates": {
-        "lifetime": None,
-        "past_30_days": None,
-        "past_7_days": None,
-        "past_24_hours": None,
-    },
-    "trade_counts": {
-        "lifetime": 0,
-        "past_30_days": 0,
-        "past_7_days": 0,
-        "past_24_hours": 0,
-    },
+    "last_update": None,
+    "recent_trades": [],
 }
 
+# Optional: recent-trades ring buffer, populated externally via
+# update_recent_trades(). Decoupled from main state for efficient access.
+_recent_trades: List[Dict[str, Any]] = []
+_recent_trades_max = 200
 
-def update_dashboard_state(**kwargs) -> None:
+
+def update_dashboard_state(**kwargs):
+    """Thread-safe atomic state replace. Called by main loop each cycle."""
     with _state_lock:
         _state.update(kwargs)
+
+
+def update_recent_trades(trades: List[Dict[str, Any]]):
+    """Push a fresh slice of the most recent closed trades (main loop)."""
+    with _state_lock:
+        _recent_trades.clear()
+        _recent_trades.extend(trades[-_recent_trades_max:])
 
 
 def _snapshot() -> Dict[str, Any]:
@@ -85,162 +88,156 @@ def _snapshot() -> Dict[str, Any]:
         return dict(_state)
 
 
-def _count_stale(positions: list) -> int:
-    """R4: number of positions with last_price_stale == True."""
-    n = 0
-    for p in positions:
-        if p.get("last_price_stale"):
-            n += 1
-    return n
+def _snapshot_trades() -> List[Dict[str, Any]]:
+    with _state_lock:
+        return list(_recent_trades)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-#  AUTH (R11)
-# ──────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  AUTH
+# ══════════════════════════════════════════════════════════════════════════
 
-def _check_auth(expected_token: str, provided_token: Optional[str]) -> bool:
-    """
-    Constant-time comparison to avoid timing leaks. If no token is
-    configured, auth is disabled (returns True).
-    """
-    if not expected_token:
-        return True
-    if not provided_token:
-        return False
-    try:
-        return hmac.compare_digest(expected_token, provided_token)
-    except Exception:
-        return False
+_AUTH_TOKEN: str = ""
 
 
-# ──────────────────────────────────────────────────────────────────────────
-#  APP BUILDER
-# ──────────────────────────────────────────────────────────────────────────
+def _check_auth(x_auth_token: Optional[str]):
+    if not _AUTH_TOKEN:
+        return  # no token configured — open access (but we warn at startup)
+    if not x_auth_token or x_auth_token != _AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-Auth-Token header",
+        )
 
-def _build_app(auth_token: str = ""):
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FASTAPI APP
+# ══════════════════════════════════════════════════════════════════════════
+
+def _build_app() -> "FastAPI":
     app = FastAPI(
-        title="IBKR Global RSI Bot",
-        version="2.1",
-        # Only expose docs when auth is configured — leaking the schema
-        # publicly is unnecessary. Operator can still hit /docs with the
-        # token when they need it.
-        docs_url="/docs" if auth_token else "/docs",
+        title="IBKR Global RSI Bot Dashboard",
+        version="2.3",
+        docs_url=None,
+        redoc_url=None,
     )
-
-    def _require_auth(x_auth_token: Optional[str]):
-        if not _check_auth(auth_token, x_auth_token):
-            # Generic 401 — do not leak whether auth is configured or not
-            raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get("/health")
     def health():
-        # R11: intentionally unauthenticated for platform health checks.
-        # Returns NO strategy/position data — just liveness + connection.
-        s = _snapshot()
+        snap = _snapshot()
+        # /health intentionally unauthenticated for platform liveness probes.
+        # It returns minimal info — no positions, no financials.
         return {
-            "status": "ok",
-            "connected_to_ibkr": s["connected"],
-            "last_update": s["last_update"],
+            "ok": True,
+            "connected": snap.get("connected"),
+            "last_update": snap.get("last_update"),
+            "account_values_healthy": snap.get("account_values_healthy"),
+            "daily_halted": snap.get("daily_halted"),
+            "max_dd_halted": snap.get("max_dd_halted"),
         }
 
     @app.get("/status")
-    def status(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-        _require_auth(x_auth_token)
-        s = _snapshot()
-        stale_count = _count_stale(s["positions"])
-        return {
-            "mode": s["mode"],
-            "connected_to_ibkr": s["connected"],
-            "nlv": round(s["nlv"], 2),
-            "cash": round(s["cash"], 2),
-            "day_start_nlv": round(s["day_start_nlv"], 2),
-            "peak_nlv": round(s["peak_nlv"], 2),
-            "day_pnl_pct": round(s["day_pnl_pct"], 3),
-            "day_pnl_dollars": round(s["day_pnl_dollars"], 2),
-            "drawdown_pct": round(s["dd_pct"], 3),
-            "open_positions": len(s["positions"]),
-            "max_positions": s["max_positions"],
-            "universe_size": s["universe_size"],
-            "regime": s["regime"],
-            "regime_mult": s["regime_mult"],
-            "vix": s["vix"],
-            "daily_halted": s["daily_halted"],
-            "max_dd_halted": s["max_dd_halted"],
-            "account_values_healthy": s.get("account_values_healthy", True),
-            "account_values_health_reason": s.get("account_values_health_reason", ""),
-            # R4: top-level stale count for at-a-glance health
-            "stale_position_count": stale_count,
-            "stale_positions_symbols": [p["symbol"] for p in s["positions"]
-                                        if p.get("last_price_stale")],
-            "last_scan_duration_seconds": s.get("last_scan_duration_seconds"),
-            "winrates": s.get("winrates", {}),
-            "trade_counts": s.get("trade_counts", {}),
-            "last_update": s["last_update"],
-        }
+    def get_status(x_auth_token: Optional[str] = Header(default=None)):
+        _check_auth(x_auth_token)
+        snap = _snapshot()
+        snap.pop("positions", None)  # separate endpoint
+        snap.pop("recent_trades", None)
+        return snap
 
     @app.get("/positions")
-    def positions(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-        _require_auth(x_auth_token)
-        s = _snapshot()
+    def get_positions(x_auth_token: Optional[str] = Header(default=None)):
+        _check_auth(x_auth_token)
+        snap = _snapshot()
         return {
-            "count": len(s["positions"]),
-            "stale_count": _count_stale(s["positions"]),
-            "positions": s["positions"],
+            "last_update": snap.get("last_update"),
+            "count": len(snap.get("positions", [])),
+            "max_positions": snap.get("max_positions"),
+            "positions": snap.get("positions", []),
+        }
+
+    @app.get("/winrates")
+    def get_winrates(x_auth_token: Optional[str] = Header(default=None)):
+        _check_auth(x_auth_token)
+        snap = _snapshot()
+        return {
+            "winrates": snap.get("winrates", {}),
+            "counts": snap.get("trade_counts", {}),
+            "last_update": snap.get("last_update"),
+        }
+
+    @app.get("/trades")
+    def get_trades(x_auth_token: Optional[str] = Header(default=None)):
+        _check_auth(x_auth_token)
+        trades = _snapshot_trades()
+        return {
+            "count": len(trades),
+            "trades": trades,
         }
 
     return app
 
 
-# ──────────────────────────────────────────────────────────────────────────
-#  STARTUP
-# ──────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  SERVER BOOTSTRAP
+# ══════════════════════════════════════════════════════════════════════════
 
-_started = False
+_server_thread: Optional[threading.Thread] = None
 
 
-def start_dashboard(port: int = 8000, host: str = "0.0.0.0", auth_token: str = "") -> bool:
+def start_dashboard(port: int, host: str = "0.0.0.0", auth_token: str = ""):
     """
-    R11: host and auth_token parameters.
-    - host: bind address (default 0.0.0.0; set 127.0.0.1 to restrict).
-    - auth_token: if non-empty, /status /positions /docs require
-      header `X-Auth-Token: <value>`. /health stays open.
+    Start the dashboard in a daemon thread. Safe to call once.
+
+    If FastAPI/uvicorn are not installed, dashboard is disabled silently.
+    If auth_token is empty, logs a warning (production should always set it).
     """
-    global _started
-    if _started:
-        log.info("Dashboard already running — skipping start")
-        return True
-    if not _FASTAPI_OK:
-        log.warning("⚠️  fastapi / uvicorn not installed — dashboard disabled "
-                    "(run: pip install fastapi uvicorn)")
-        return False
+    global _server_thread, _AUTH_TOKEN
 
-    app = _build_app(auth_token=auth_token)
+    if not _FASTAPI_AVAILABLE:
+        log.warning("Dashboard disabled: fastapi/uvicorn not installed")
+        return
 
-    auth_label = "AUTHENTICATED" if auth_token else "⚠️  UNAUTHENTICATED (anyone with network access can read strategy/positions)"
+    if _server_thread is not None and _server_thread.is_alive():
+        log.info("Dashboard already running")
+        return
 
-    def _run():
+    _AUTH_TOKEN = auth_token or ""
+
+    if not _AUTH_TOKEN:
+        log.warning(
+            "⚠️  Dashboard AUTH_TOKEN is empty — /status, /positions, /winrates, "
+            "/trades are OPEN. Set DASHBOARD_AUTH_TOKEN in env for production. "
+            "Generate with: openssl rand -hex 32"
+        )
+    else:
+        log.info(f"🔒 Dashboard auth token configured ({len(_AUTH_TOKEN)} chars)")
+
+    if host == "0.0.0.0":
+        log.warning(
+            f"🌐 Dashboard binding to 0.0.0.0:{port} — reachable from any "
+            f"interface. Restrict via DASHBOARD_HOST=127.0.0.1 if behind a "
+            f"reverse proxy or private network."
+        )
+
+    app = _build_app()
+
+    def _serve():
         try:
             config = uvicorn.Config(
-                app, host=host, port=port,
-                log_level="warning", access_log=False,
+                app,
+                host=host,
+                port=port,
+                log_level="warning",
+                access_log=False,
                 loop="asyncio",
             )
             server = uvicorn.Server(config)
-            server.install_signal_handlers = lambda: None  # type: ignore
             server.run()
         except Exception as e:
-            log.error(f"Dashboard crashed: {type(e).__name__}: {e}")
+            log.error(f"Dashboard server failed: {e}")
 
-    t = threading.Thread(target=_run, daemon=True, name="dashboard")
-    t.start()
-    _started = True
-    log.info(
-        f"🌐 Dashboard started on {host}:{port} [{auth_label}] — "
-        f"/health /status /positions /docs"
+    _server_thread = threading.Thread(
+        target=_serve, daemon=True, name="dashboard-http"
     )
-    if not auth_token:
-        log.warning(
-            "⚠️  DASHBOARD_AUTH_TOKEN is not set. Set it in env for production. "
-            "Anyone reachable at the bind address can read positions and strategy state."
-        )
-    return True
+    _server_thread.start()
+    log.info(f"📊 Dashboard listening on http://{host}:{port}")

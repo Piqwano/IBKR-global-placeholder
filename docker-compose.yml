@@ -1,49 +1,93 @@
+# Global RSI Bot — Docker Compose v2.3
+# ═══════════════════════════════════════════════════════════════════════════
+# Two services:
+#   ib-gateway  : Interactive Brokers gateway (TWS API bridge)
+#   rsi-bot     : The trading bot (connects to gateway via compose network)
+#
+# v2.3 fixes:
+#   L3: Gateway ports bound to 127.0.0.1 only — NOT reachable from network.
+#       The bot reaches the gateway via the compose-internal network
+#       ("ib-gateway:4003"), which is UNAFFECTED by host port binding.
+#       Host binding exists only for local debugging (TWS GUI, port probes).
+#       If you need remote access to the gateway, use an SSH tunnel or
+#       a VPN — never expose 4003/4004 on 0.0.0.0 in production.
+#
+# Notes:
+#   - IB_GATEWAY_PORT must be 4003 for LIVE, 4004 for PAPER. The gnzsnz
+#     image auto-calculates socat port as API port + 2:
+#       TWS_PORT=4001 (live)  → socat 4003
+#       TWS_PORT=4002 (paper) → socat 4004
+#   - Live accounts require 2FA via the IBKR Key mobile app within 2-3
+#     min of each gateway redeploy. Keep the phone ready.
+
 services:
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
+    restart: unless-stopped
     environment:
       TWS_USERID: ${TWS_USERID}
       TWS_PASSWORD: ${TWS_PASSWORD}
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      # Auto-restart gateway weekly to avoid IBKR's forced-logout timer
-      TIME_ZONE: UTC
-      TWS_SETTINGS_PATH: /home/ibgateway/Jts
+      TRADING_MODE: ${TRADING_MODE:-paper}   # "live" or "paper"
       READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: "exit"
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_2FA_TIMEOUT: "yes"
+      TIME_ZONE: ${TZ:-Australia/Melbourne}
     ports:
-      # Expose socat ports — paper 4004, live 4003
-      - "4003:4003"
-      - "4004:4004"
+      # L3: Bind to loopback only. The rsi-bot reaches the gateway via
+      # the compose-internal network ("ib-gateway" hostname) — host
+      # port binding is for local debug only.
+      - "127.0.0.1:4003:4003"   # live socat
+      - "127.0.0.1:4004:4004"   # paper socat
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4003 || nc -z localhost 4004"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     volumes:
-      - ib-gateway-settings:/home/ibgateway/Jts
-    restart: unless-stopped
+      - ib-gateway-config:/root/Jts
+    networks:
+      - rsi-net
 
   rsi-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: rsi-bot
+    restart: unless-stopped
     depends_on:
-      - ib-gateway
+      ib-gateway:
+        condition: service_healthy
     environment:
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_HOST: "ib-gateway"
+      # 4003 = live socat  |  4004 = paper socat (gnzsnz auto-mapping)
       IB_GATEWAY_PORT: ${IB_GATEWAY_PORT:-4004}
       IB_CLIENT_ID: ${IB_CLIENT_ID:-10}
+      TRADING_MODE: ${TRADING_MODE:-paper}
       IB_MARKET_DATA: ${IB_MARKET_DATA:-delayed}
       DAILY_RESET_TZ: ${DAILY_RESET_TZ:-America/New_York}
-      RESET_MAX_DD: ${RESET_MAX_DD:-}
-      BOT_STATE_FILE: /app/state/bot_state.json
-      ADOPT_ORPHAN: ${ADOPT_ORPHAN:-}
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
-      # Dashboard (R11)
-      PORT: ${PORT:-8000}
+      ADOPT_ORPHAN: ${ADOPT_ORPHAN:-}
+      RESET_MAX_DD: ${RESET_MAX_DD:-}
+      STARTUP_SELF_TEST: ${STARTUP_SELF_TEST:-1}
       DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
       DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:-}
+      BOT_STATE_FILE: "/state/bot_state.json"
+      TZ: ${TZ:-Australia/Melbourne}
     ports:
-      - "8000:8000"
+      # Dashboard — set DASHBOARD_HOST=127.0.0.1 if behind a reverse proxy
+      - "${DASHBOARD_EXPOSE:-8000}:8000"
     volumes:
-      - rsi-bot-state:/app/state
-    restart: unless-stopped
+      - bot-state:/state
+    networks:
+      - rsi-net
+
+networks:
+  rsi-net:
+    driver: bridge
 
 volumes:
-  ib-gateway-settings:
-  rsi-bot-state:
+  ib-gateway-config:
+  bot-state:

@@ -1,19 +1,23 @@
 """
-IBKR Helpers — Connection, Data, Bracket Orders, Regime, Guards
-=================================================================
+IBKR Helpers — Connection, Data, Bracket Orders, Regime, Guards (v2.3)
+========================================================================
 Thread-safe connection management, event-driven trade waits with partial-fill
 handling, bracket orders with server-side TP + trailing stop, market-hours
 gating, atomic post-fill TP repair (in-place amend), VIX-aware market
 regime with safe degradation, execution lookup for trade-history
 reconciliation.
 
-R-round hardening added on top of B1–B4 / H1–H4:
-  R1: account_values_healthy flag set by _resolve_account_value; buy gate
-  R2: _modify_tp_limit_price verifies status post-submit
-  R7: buy_stock_bracket partial-fill places new bracket BEFORE cancelling old
-  R8: has_protective_orders filters on active statuses AND qty coverage
-  R9: _verify_order_live polls orderStatus after placement
-  R12: _manager clears regime + VIX caches on successful reconnect
+v2.3 fixes (on top of R-round):
+  C1: account-values health is now cycle-atomic via collect_account_summary()
+  C2: _place_bracket wraps full sequence in rollback try/finally
+  C3: _reconcile_post_sell corroborates disagreement with fills before
+      preferring arithmetic (prevents phantom-share re-attach)
+  C4/M8: has_protective_orders verifies TP+trail composition, not just qty
+  H6: OCA groups use UUID suffix to eliminate collisions
+  M2: market-hours grace is open-side ZERO, close-side 5 min
+  M7: VIX gets its own tight TTL (VIX_CACHE_TTL)
+  H2: _wait_for_fill handles PendingCancel explicitly as terminal-dead
+  H8: _verify_order_live distinguishes "filled-too-early" from "active"
 """
 
 import asyncio
@@ -21,8 +25,9 @@ import logging
 import math
 import threading
 import time as _time
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, NamedTuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -39,12 +44,12 @@ from config import (
     IB_HOST, IB_PORT, IB_CLIENT_ID,
     CASH_RESERVE_PCT, MAX_POSITIONS, MAX_PER_CORR_GROUP,
     CORR_GROUPS, BARS_FOR_RSI, RSI_PERIOD, SEHK_LOT_SIZES,
-    MARKET_DATA_LIVE, REGIME_CACHE_TTL,
+    MARKET_DATA_LIVE, REGIME_CACHE_TTL, VIX_CACHE_TTL,
     MARKET_DATA_SNAPSHOT_WAIT, MARKET_DATA_BATCH_WAIT,
     CONNECTION_TIMEOUT, TRADE_FILL_TIMEOUT,
     RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY,
     RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_ATTEMPTS,
-    EXCHANGE_SESSIONS, MARKET_HOURS_GRACE_MINS,
+    EXCHANGE_SESSIONS, MARKET_HOURS_GRACE_MINS_OPEN, MARKET_HOURS_GRACE_MINS_CLOSE,
     ATR_PERIOD, ATR_PERIOD_FOR_SIZING,
     USE_BRACKET_ORDERS, REPAIR_TP_AFTER_FILL,
     DEFAULT_TRAILING_STOP, DEFAULT_TAKE_PROFIT,
@@ -57,13 +62,19 @@ log = logging.getLogger("ibkr-rsi")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT-VALUE HEALTH FLAG  (R1)
+#  ACCOUNT-VALUE HEALTH FLAG  (R1 + C1 CYCLE-ATOMIC FIX)
 # ══════════════════════════════════════════════════════════════════════════
-# Module-level flag set by _resolve_account_value. The main loop's try_buy
-# consults this via account_values_healthy() before sizing any new position.
-# False means the last BASE-currency resolution for NLV or cash fell back
-# to a per-currency value (degraded) OR failed outright — we block buys
-# until the next accountSummary returns cleanly.
+# v2.3 C1: Previously _resolve_account_value was called per-tag and every
+# clean tag overrode the flag to True — meaning a degraded NLV followed by
+# a clean TotalCashValue in the same accountSummary cycle would leave the
+# flag True. We now do atomic per-cycle resolution:
+#   - _resolve_account_value_raw(...) returns (value, healthy_bool, reason)
+#     and does NOT touch the module flag.
+#   - collect_account_summary(...) does all the resolutions in one pass
+#     then calls _set_account_health(final_healthy, combined_reason) once.
+# Legacy _resolve_account_value kept as a thin wrapper for callers that
+# still need a single value (none remain, but defensive).
+
 _account_values_healthy: bool = True
 _account_values_health_reason: str = ""
 _account_values_lock = threading.Lock()
@@ -85,6 +96,102 @@ def _set_account_health(healthy: bool, reason: str = ""):
                 log.info(f"✅ Account-values health restored: {reason or 'clean BASE resolution'}")
             else:
                 log.error(f"🚫 Account-values health DEGRADED — new buys blocked until resolved: {reason}")
+
+
+class _ResolutionResult(NamedTuple):
+    value: float
+    healthy: bool
+    reason: str
+
+
+def _resolve_account_value_raw(account_values, tag: str,
+                               allowed_currencies=("USD", "AUD", "CAD", "SGD", "GBP", "EUR")
+                               ) -> _ResolutionResult:
+    """
+    C1: Pure function. Returns (value, healthy, reason).
+    Does NOT touch the module health flag — that's the cycle-level caller's
+    job so one degraded tag can poison the whole cycle atomically.
+    """
+    # Pass 1 — BASE is authoritative
+    for item in account_values:
+        if item.tag == tag and item.currency == "BASE":
+            try:
+                val = float(item.value)
+                return _ResolutionResult(val, True, f"{tag} BASE clean")
+            except (TypeError, ValueError):
+                return _ResolutionResult(
+                    0.0, False,
+                    f"malformed BASE value for {tag}: {item.value!r}"
+                )
+
+    # Pass 2 — no BASE, fall back
+    for item in account_values:
+        if item.tag == tag and item.currency in allowed_currencies:
+            try:
+                val = float(item.value)
+                reason = (f"no BASE row for {tag} — fell back to "
+                          f"{item.currency} {val}")
+                log.warning(f"⚠️  {reason}. Verify IBKR account config.")
+                return _ResolutionResult(val, False, reason)
+            except (TypeError, ValueError):
+                continue
+
+    return _ResolutionResult(
+        0.0, False, f"could not resolve {tag} from accountSummary"
+    )
+
+
+def _resolve_account_value(account_values, tag: str,
+                           allowed_currencies=("USD", "AUD", "CAD", "SGD", "GBP", "EUR")) -> float:
+    """
+    Backwards-compat shim. Callers should prefer collect_account_summary
+    for cycle-atomic health. This single-tag version does NOT update the
+    module flag (that was the C1 bug); the caller is responsible.
+    """
+    result = _resolve_account_value_raw(account_values, tag, allowed_currencies)
+    if not result.healthy:
+        log.error(f"{result.reason} — returning value {result.value} (health untouched)")
+    return result.value
+
+
+def collect_account_summary(tags=("NetLiquidation", "TotalCashValue", "BuyingPower",
+                                   "UnrealizedPnL", "RealizedPnL")) -> Dict[str, float]:
+    """
+    C1: Cycle-atomic account-values resolution.
+
+    Resolves every requested tag, aggregates health, and sets the module-level
+    flag ONCE based on whether ALL tags resolved cleanly via BASE. Any single
+    degraded tag marks the whole cycle as degraded — try_buy will block.
+    """
+    ib = get_ib()
+    try:
+        account_values = ib.accountSummary()
+    except Exception as e:
+        _set_account_health(False, f"accountSummary call failed: {e}")
+        return {}
+
+    present_tags = {item.tag for item in account_values}
+    result: Dict[str, float] = {}
+    cycle_healthy = True
+    failure_reasons: List[str] = []
+
+    for tag in tags:
+        if tag not in present_tags:
+            # Tag absent — not necessarily a health issue (e.g., RealizedPnL
+            # may be absent on fresh accounts). Skip but don't penalise.
+            continue
+        res = _resolve_account_value_raw(account_values, tag)
+        result[tag] = res.value
+        if not res.healthy:
+            cycle_healthy = False
+            failure_reasons.append(res.reason)
+
+    if cycle_healthy:
+        _set_account_health(True, "all tags BASE-resolved cleanly")
+    else:
+        _set_account_health(False, "; ".join(failure_reasons))
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -149,10 +256,8 @@ class IBConnectionManager:
                 self._connected = True
 
                 # R12: clear ALL caches that could carry stale state across
-                # a reconnect. Previously only _contract_cache was cleared;
-                # regime/VIX could still return up-to-30-min-old values,
-                # which is especially dangerous after a long outage where
-                # the market may have materially moved.
+                # a reconnect. VIX uses its own TTL now (M7) but the cache
+                # itself is reset here to avoid cross-session staleness.
                 self._contract_cache.clear()
                 self._regime_cache = None
                 self._regime_time = 0.0
@@ -215,8 +320,10 @@ class IBConnectionManager:
             self._regime_time = _time.time()
 
     def get_vix_cache(self) -> Optional[float]:
+        """M7: VIX has its own TTL (VIX_CACHE_TTL, default 120s) because
+        during fast markets VIX moves far faster than SPY-200MA regime."""
         with self._lock:
-            if self._vix_cache and (_time.time() - self._vix_cache[1]) < REGIME_CACHE_TTL:
+            if self._vix_cache and (_time.time() - self._vix_cache[1]) < VIX_CACHE_TTL:
                 return self._vix_cache[0]
             return None
 
@@ -241,61 +348,15 @@ def is_connected() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT VALUE RESOLUTION  (B1 + R1)
-# ══════════════════════════════════════════════════════════════════════════
-
-def _resolve_account_value(account_values, tag: str,
-                           allowed_currencies=("USD", "AUD", "CAD", "SGD", "GBP", "EUR")) -> float:
-    """
-    B1: Deterministic two-pass resolution: BASE first, then allowed currency.
-    R1: Updates the module-level health flag. If BASE resolved cleanly and
-        we haven't seen any failure in this resolution, health is True; any
-        fallback or failure flips it False and the main loop's try_buy
-        will block new buys until the next accountSummary call restores it.
-
-    NOTE: because this is called per-tag, one degraded tag will poison
-    subsequent clean tags in the same accountSummary cycle. That's the
-    intended conservative behaviour — if any tag is degraded we don't
-    trust the snapshot.
-    """
-    # Pass 1 — BASE is always authoritative
-    for item in account_values:
-        if item.tag == tag and item.currency == "BASE":
-            try:
-                val = float(item.value)
-                # Clean BASE resolution — mark health True (only if still True)
-                _set_account_health(True, f"BASE resolved cleanly for {tag}")
-                return val
-            except (TypeError, ValueError):
-                log.error(f"Malformed BASE value for {tag}: {item.value!r}")
-                _set_account_health(False, f"malformed BASE value for {tag}: {item.value!r}")
-                return 0.0
-
-    # Pass 2 — no BASE, fall back
-    for item in account_values:
-        if item.tag == tag and item.currency in allowed_currencies:
-            try:
-                val = float(item.value)
-                msg = (f"No BASE row for {tag} in accountSummary — "
-                       f"falling back to {item.currency} {val}")
-                log.warning(f"⚠️  {msg}. Verify IBKR account config.")
-                # R1: degraded — new buys blocked until BASE comes back
-                _set_account_health(False, msg)
-                return val
-            except (TypeError, ValueError):
-                continue
-
-    msg = f"Could not resolve {tag} from accountSummary"
-    log.error(f"{msg} — returning 0.0 (conservative)")
-    _set_account_health(False, msg)
-    return 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  MARKET HOURS
+#  MARKET HOURS  (M2)
 # ══════════════════════════════════════════════════════════════════════════
 
 def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool, str]:
+    """
+    M2: grace split — ZERO grace on open-side (no pre-market buys into thin
+    liquidity / no live price), 5-min grace on close-side (lets TP/trail
+    fill right at the bell).
+    """
     sess = EXCHANGE_SESSIONS.get(exchange)
     if not sess:
         return True, "unknown exchange — deferring to IBKR"
@@ -306,11 +367,12 @@ def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool,
     if now.weekday() not in sess["days"]:
         return False, f"{exchange} closed (weekend, local {now.strftime('%a %H:%M')})"
 
-    grace = timedelta(minutes=MARKET_HOURS_GRACE_MINS)
+    open_grace = timedelta(minutes=MARKET_HOURS_GRACE_MINS_OPEN)
+    close_grace = timedelta(minutes=MARKET_HOURS_GRACE_MINS_CLOSE)
     open_dt = now.replace(hour=sess["open"].hour, minute=sess["open"].minute,
-                          second=0, microsecond=0) - grace
+                          second=0, microsecond=0) - open_grace
     close_dt = now.replace(hour=sess["close"].hour, minute=sess["close"].minute,
-                           second=0, microsecond=0) + grace
+                           second=0, microsecond=0) + close_grace
 
     if not (open_dt <= now <= close_dt):
         return False, f"{exchange} closed (local {now.strftime('%H:%M')}, session {sess['open']}-{sess['close']})"
@@ -407,15 +469,22 @@ def _extract_price(ticker) -> Optional[float]:
 
 def get_current_price(contract: Stock) -> Optional[float]:
     ib = get_ib()
+    ticker = None
     try:
         ticker = ib.reqMktData(contract, "", True, False)
         ib.sleep(MARKET_DATA_SNAPSHOT_WAIT)
         price = _extract_price(ticker)
-        ib.cancelMktData(contract)
         return round(price, 4) if price else None
     except Exception as e:
         log.warning(f"Price error {contract.symbol}: {e}")
         return None
+    finally:
+        # L7: always cancel the subscription, even on exception
+        if ticker is not None:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
 
 
 def get_prices_batch(contracts: Dict[str, Stock]) -> Dict[str, Optional[float]]:
@@ -436,7 +505,10 @@ def get_prices_batch(contracts: Dict[str, Stock]) -> Dict[str, Optional[float]]:
         p = _extract_price(ticker)
         prices[symbol] = round(p, 4) if p else None
 
-    for contract in contracts.values():
+    # Always cancel every subscription we started (L7)
+    for symbol, contract in contracts.items():
+        if symbol not in tickers:
+            continue
         try:
             ib.cancelMktData(contract)
         except Exception:
@@ -626,25 +698,24 @@ def get_market_regime() -> Tuple[str, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  GUARDS  (B1 + R1)
+#  GUARDS  (B1 + R1 + C1)
 # ══════════════════════════════════════════════════════════════════════════
 
 def cash_guard_check() -> Tuple[bool, float, float]:
     """
-    B1: Deterministic BASE-currency resolution.
-    R1: If account_values_healthy() is False, block the buy — we don't
-        trust the snapshot. _resolve_account_value has already logged why.
+    C1: Uses collect_account_summary for atomic health update.
+    If health is degraded, blocks the buy and returns (False, 0, 0).
     """
-    ib = get_ib()
     try:
-        account_values = ib.accountSummary()
-        cash = _resolve_account_value(account_values, "TotalCashValue")
-        portfolio = _resolve_account_value(account_values, "NetLiquidation")
+        values = collect_account_summary(("TotalCashValue", "NetLiquidation"))
 
         healthy, reason = account_values_healthy()
         if not healthy:
             log.info(f"  🚫 Cash guard: account-values degraded ({reason}) — blocking buy")
             return False, 0.0, 0.0
+
+        cash = values.get("TotalCashValue", 0.0)
+        portfolio = values.get("NetLiquidation", 0.0)
 
         if portfolio <= 0:
             return False, 0.0, 0.0
@@ -682,8 +753,9 @@ def correlation_check(symbol: str, current_positions: dict) -> Tuple[bool, str]:
 
 # R9: order statuses that indicate the order is live and working
 _ACTIVE_ORDER_STATUSES = {"Submitted", "PreSubmitted", "Accepted", "ApiPending"}
-# Statuses that indicate terminal non-fill (cancelled or rejected)
-_TERMINAL_DEAD_STATUSES = {"Cancelled", "ApiCancelled", "Inactive"}
+# H2: statuses that indicate terminal non-fill (including PendingCancel
+# which was previously treated as "keep waiting")
+_TERMINAL_DEAD_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "PendingCancel"}
 
 
 def _calc_quantity(contract: Stock, amount: float, price: float) -> Optional[int]:
@@ -710,6 +782,12 @@ def _calc_quantity(contract: Stock, amount: float, price: float) -> Optional[int
 
 
 def _wait_for_fill(trade: Trade, timeout: float = TRADE_FILL_TIMEOUT) -> Tuple[bool, int]:
+    """
+    H2: terminal-dead statuses now include PendingCancel. Previously
+    PendingCancel was treated as "keep waiting", which could cause the
+    caller to time out and assume rejection — while the order silently
+    filled on the next broker update.
+    """
     ib = get_ib()
     deadline = _time.time() + timeout
     total_qty = int(trade.order.totalQuantity)
@@ -721,7 +799,7 @@ def _wait_for_fill(trade: Trade, timeout: float = TRADE_FILL_TIMEOUT) -> Tuple[b
         if status == "Filled" or filled_qty >= total_qty:
             return True, filled_qty
 
-        if status in ("Cancelled", "ApiCancelled", "Inactive") and filled_qty == 0:
+        if status in _TERMINAL_DEAD_STATUSES and filled_qty == 0:
             return False, 0
 
         ib.waitOnUpdate(timeout=1.0)
@@ -744,22 +822,32 @@ def _safe_cancel(trade_or_order):
         pass
 
 
+def _oca_group_name(symbol: str, purpose: str = "") -> str:
+    """H6: UUID-based OCA group naming eliminates collision risk."""
+    suffix = uuid.uuid4().hex[:8]
+    prefix = f"OCA_{symbol}"
+    if purpose:
+        prefix = f"{prefix}_{purpose}"
+    return f"{prefix}_{suffix}"
+
+
 # ══════════════════════════════════════════════════════════════════════════
-#  ORDER VERIFICATION  (R9)
+#  ORDER VERIFICATION  (R9 + H8)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _verify_order_live(trade: Trade, timeout: float = ORDER_PLACEMENT_VERIFY_SECS,
-                       label: str = "") -> bool:
+                       label: str = "",
+                       allow_filled: bool = True) -> bool:
     """
     R9: Poll orderStatus for up to `timeout` seconds to verify a freshly-
-    placed or amended order actually became active. Returns True if the
-    order reached an active status (Submitted/PreSubmitted/Accepted) OR
-    filled (rare but possible for amends). Returns False if the order
-    landed in Cancelled/Inactive OR we timed out in a pre-transmit state.
+    placed or amended order actually became active.
 
-    Used after placements and amendments to catch silent rejections
-    (bad tick size, exchange closed, etc.) before the caller trusts the
-    orderId.
+    H8: `allow_filled` controls whether a 'Filled' status counts as success.
+    For BUY parents, yes. For child TP/trail orders freshly placed, a
+    'Filled' during the verification window means the protection is
+    ALREADY GONE (position closed immediately — possible on a gapping
+    market). Caller should set allow_filled=False for children and handle
+    the insta-fill branch explicitly.
     """
     if trade is None or trade.order is None:
         return False
@@ -773,8 +861,17 @@ def _verify_order_live(trade: Trade, timeout: float = ORDER_PLACEMENT_VERIFY_SEC
     while _time.time() < deadline:
         status = trade.orderStatus.status or ""
         last_status = status
-        if status in _ACTIVE_ORDER_STATUSES or status == "Filled":
+        if status in _ACTIVE_ORDER_STATUSES:
             return True
+        if status == "Filled":
+            if allow_filled:
+                return True
+            # H8: caller doesn't want instant-fill counted as "live"
+            log.warning(
+                f"⚠️  {tag} filled during verification window — "
+                f"protective order already terminal"
+            )
+            return False
         if status in _TERMINAL_DEAD_STATUSES:
             reason = trade.log[-1].message if trade.log else "no log"
             log.error(f"❌ {tag} rejected/dead: {status} — {reason}")
@@ -794,28 +891,19 @@ def _verify_order_live(trade: Trade, timeout: float = ORDER_PLACEMENT_VERIFY_SEC
 
 def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
     """
-    B2: In-place amend of TP limit preserving OCA linkage — no unprotected
-    window.
-    R2: Verify post-submit that the amended order is still live. If the
-    amendment is rejected (tick-size violation, etc.) the ORIGINAL order
-    remains intact and protective; this function returns False so the
-    caller knows NOT to trust the "new" state. Caller is expected to
-    leave the stored tp_order_id pointing at the original (still-live)
-    order.
+    B2: In-place amend of TP limit preserving OCA linkage.
+    R2: Verify post-submit that the amended order is still live.
     """
     if tp_trade is None or tp_trade.order is None:
         return False
     ib = get_ib()
     try:
         tp_trade.order.lmtPrice = round(new_limit_price, 2)
-        # Same orderId + contract → IBKR treats as amendment, not new order
         ib.placeOrder(tp_trade.contract, tp_trade.order)
-        # R2: verify it actually landed cleanly
         if not _verify_order_live(tp_trade, label="TP amend"):
             log.error(
                 f"⚠️  TP amendment did NOT verify active for {tp_trade.contract.symbol}; "
-                f"original TP order may have been modified BUT status is uncertain. "
-                f"Original OCA linkage preserved — position remains protected. "
+                f"original OCA linkage preserved — position remains protected. "
                 f"Manual inspection recommended."
             )
             return False
@@ -826,14 +914,14 @@ def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  BRACKET PLACEMENT
+#  BRACKET PLACEMENT  (H6 + H8 + C2 rollback)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: float,
                                 trail_pct: float, tp_pct: float,
-                                oca_group_suffix: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
+                                purpose: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
     ib = get_ib()
-    oca = f"OCA_{contract.symbol}_{oca_group_suffix or int(_time.time())}"
+    oca = _oca_group_name(contract.symbol, purpose)
     tp_price = round(entry_ref_price * (1 + tp_pct), 2)
 
     tp = LimitOrder("SELL", qty, tp_price)
@@ -858,9 +946,11 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
         tp_trade = ib.placeOrder(contract, tp)
         trail_trade = ib.placeOrder(contract, trail)
 
-        # R9: verify both children actually went live
-        tp_ok = _verify_order_live(tp_trade, label="child TP")
-        trail_ok = _verify_order_live(trail_trade, label="child trail")
+        # R9 + H8: verify children go live; a child "Filled" during the
+        # verification window means protection is already gone — treat as
+        # failure so caller can react instead of silently trusting the id.
+        tp_ok = _verify_order_live(tp_trade, label="child TP", allow_filled=False)
+        trail_ok = _verify_order_live(trail_trade, label="child trail", allow_filled=False)
         if not (tp_ok and trail_ok):
             log.error(
                 f"🚨 Child bracket for {contract.symbol} placement unverified "
@@ -884,11 +974,17 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
 
 def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
                    trail_pct: float, tp_pct: float) -> Optional[Tuple[Trade, Trade, Trade]]:
+    """
+    C2: Full rollback on any mid-sequence exception. If parent submitted
+    and any child placement raises, cancel everything we got back before
+    returning None — no unprotected half-brackets.
+    H6: UUID-based OCA group name.
+    """
     ib = get_ib()
     parent_id = ib.client.getReqId()
     tp_id = ib.client.getReqId()
     trail_id = ib.client.getReqId()
-    oca_group = f"OCA_{contract.symbol}_{parent_id}_{int(_time.time())}"
+    oca_group = _oca_group_name(contract.symbol, f"parent{parent_id}")
 
     tp_price = round(entry_price_est * (1 + tp_pct), 2)
 
@@ -914,8 +1010,7 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
     trail.ocaGroup = oca_group
     trail.ocaType = 1
     trail.tif = "GTC"
-    trail.tif = "GTC"
-    trail.transmit = True
+    trail.transmit = True    # Final leg releases the whole group
 
     parent_trade = None
     tp_trade = None
@@ -926,7 +1021,11 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
         trail_trade = ib.placeOrder(contract, trail)
         return parent_trade, tp_trade, trail_trade
     except Exception as e:
-        log.error(f"Bracket placement failed for {contract.symbol}: {e}")
+        # C2: rollback everything we got back before raising
+        log.critical(
+            f"🚨 Bracket placement FAILED mid-sequence for {contract.symbol}: {e}. "
+            f"Rolling back any submitted legs."
+        )
         for t in (parent_trade, tp_trade, trail_trade):
             if t is not None:
                 _safe_cancel(t)
@@ -934,28 +1033,11 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  BUY — BRACKET  (R7 — partial-fill place-before-cancel)
+#  BUY — BRACKET  (R7)
 # ══════════════════════════════════════════════════════════════════════════
 
 def buy_stock_bracket(contract: Stock, amount: float,
                       trail_pct: float, tp_pct: float) -> Optional[dict]:
-    """
-    R7 critical change: on partial fill, place the NEW reduced-qty bracket
-    BEFORE cancelling the old parent's children. Previously we cancelled
-    first then replaced, opening a ~1.5s window where the filled shares
-    were unprotected. Now:
-
-      1. Detect partial fill (parent incomplete, filled_qty > 0).
-      2. Place a new child OCA bracket sized to `filled_qty`.
-      3. Verify it's live (R9).
-      4. ONLY THEN cancel the original parent remainder and its OCA children.
-
-    Brief (1–2s) overlap where both old-oversized and new-correct brackets
-    exist is harmless: worst case one of them fires and the other gets
-    cancelled by the OCA group (old children) or rejected by IBKR for
-    over-selling. A gap in protection is unacceptable; a double-cover is
-    tolerable.
-    """
     ib = get_ib()
     price = get_current_price(contract)
     if not price or price <= 0:
@@ -982,24 +1064,19 @@ def buy_stock_bracket(contract: Stock, amount: float,
         return None
 
     if not filled and filled_qty > 0:
-        # ── R7: PLACE-BEFORE-CANCEL on partial fill ───────────────────
+        # R7: PLACE-BEFORE-CANCEL on partial fill
         log.warning(
             f"⚠️  {contract.symbol} PARTIAL fill {filled_qty}/{qty} — "
             f"R7: placing new correctly-sized bracket BEFORE cancelling old"
         )
         actual_price = parent_trade.orderStatus.avgFillPrice or price
 
-        # Step 1: place the new reduced-qty bracket first
         new_tp, new_trail = _place_child_bracket_orders(
             contract, filled_qty, actual_price, trail_pct, tp_pct,
-            oca_group_suffix=f"repair_{parent_trade.order.orderId}"
+            purpose=f"repair_p{parent_trade.order.orderId}"
         )
 
         if new_tp is None or new_trail is None:
-            # New bracket failed to go live — we have NOT yet cancelled the
-            # old oversized bracket, so the old TP+trail are still covering
-            # the partial fill (oversized, will reject excess at fill time
-            # but the protective direction is intact). Better than nothing.
             log.critical(
                 f"🚨 {contract.symbol}: NEW partial-fill bracket failed to place/verify. "
                 f"Leaving OLD oversized bracket in place — it WILL protect the "
@@ -1007,14 +1084,10 @@ def buy_stock_bracket(contract: Stock, amount: float,
                 f"the parent remainder. Manual review required."
             )
             _safe_cancel(parent_trade)
-            # Intentionally do NOT cancel tp_trade / trail_trade — they are
-            # the current protection. An OCA over-qty sell will be rejected
-            # or partially filled by IBKR; that's safer than no protection.
             actual_qty = filled_qty
             tp_order_id = str(tp_trade.order.orderId) if tp_trade else None
             trail_order_id = str(trail_trade.order.orderId) if trail_trade else None
         else:
-            # Step 2: new bracket is LIVE. NOW safe to cancel parent + old children.
             log.info(
                 f"   ✅ New partial-fill bracket live "
                 f"(TP#{new_tp.order.orderId}, Trail#{new_trail.order.orderId}); "
@@ -1023,14 +1096,13 @@ def buy_stock_bracket(contract: Stock, amount: float,
             _safe_cancel(parent_trade)
             _safe_cancel(tp_trade)
             _safe_cancel(trail_trade)
-            # Short settle wait — OCA accept/reject takes milliseconds
             ib.waitOnUpdate(timeout=0.5)
             actual_qty = filled_qty
             tp_order_id = str(new_tp.order.orderId)
             trail_order_id = str(new_trail.order.orderId)
 
     else:
-        # ── Full fill path ────────────────────────────────────────────
+        # Full fill path
         actual_price = parent_trade.orderStatus.avgFillPrice or price
         actual_qty = int(parent_trade.orderStatus.filled or qty)
         tp_order_id = str(tp_trade.order.orderId)
@@ -1046,10 +1118,6 @@ def buy_stock_bracket(contract: Stock, amount: float,
                 if _modify_tp_limit_price(tp_trade, correct_tp):
                     log.info(f"     ✅ TP amended in place (orderId {tp_order_id})")
                 else:
-                    # R2: amend failed or didn't verify. tp_order_id stays
-                    # pointing at the ORIGINAL order which IBKR confirmed
-                    # was live before the amend attempt. Position remains
-                    # protected at the old TP price.
                     log.error(
                         f"  ⚠️  TP amend failed/unverified for {contract.symbol}; "
                         f"keeping original TP @ ${current_tp_price:.2f} "
@@ -1072,6 +1140,10 @@ def buy_stock_bracket(contract: Stock, amount: float,
 
 
 def buy_stock_simple(contract: Stock, amount: float) -> Optional[dict]:
+    log.critical(
+        "🚨 buy_stock_simple invoked — USE_BRACKET_ORDERS=False means NO PROTECTION. "
+        "This is an unsafe configuration for real money. Verify intent."
+    )
     ib = get_ib()
     price = get_current_price(contract)
     if not price or price <= 0:
@@ -1175,16 +1247,18 @@ def cancel_all_orders():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  EXECUTION LOOKUP  (B3 + R3 — clamp fix in caller)
+#  EXECUTION LOOKUP  (B3)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_recent_sell_fill(contract: Stock,
                          lookback_seconds: int = 86400,
                          opened_after: Optional[datetime] = None) -> Optional[dict]:
     """
-    B3: Summed weighted-average SELL fills with opened_after floor to
-    prevent cross-trade contamination. Returns {"price", "qty", "exec_id",
-    "time"} or None.
+    B3: Summed weighted-average SELL fills with opened_after floor.
+    Returns {"price", "qty", "exec_id", "time"} or None.
+
+    C3 note: used by _reconcile_post_sell to corroborate IBKR position
+    readings vs arithmetic before the "prefer arithmetic" branch fires.
     """
     ib = get_ib()
     try:
@@ -1254,22 +1328,25 @@ def get_recent_sell_fill(contract: Stock,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  BRACKET RE-ATTACHMENT  (R8)
+#  BRACKET RE-ATTACHMENT  (R8 + C4/M8)
 # ══════════════════════════════════════════════════════════════════════════
 
-def has_protective_orders(contract: Stock, required_qty: Optional[int] = None) -> bool:
+def inspect_protective_orders(contract: Stock) -> dict:
     """
-    R8: A position is "protected" only if active SELL orders cover at least
-    `required_qty` (or >= 1 share if qty not specified). Previously this
-    counted cancelled/inactive orders because `ib.openTrades()` can include
-    stale rows briefly after cancellation. That could cause orphan adoption
-    to SKIP attaching a bracket, leaving a real position unprotected.
+    C4/M8: Decompose active SELL protective orders into TP (limit) vs
+    trail (TRAIL) components. Used to detect half-protected positions
+    that need bracket re-attachment.
 
-    Now we filter on active statuses AND sum qty to verify real coverage.
+    Returns: {
+        "tp_qty": int,           # summed qty of active LIMIT SELL orders
+        "trail_qty": int,        # summed qty of active TRAIL SELL orders
+        "other_qty": int,        # other active SELL orders (stop, stop-limit, ...)
+        "total_qty": int,
+    }
     """
     ib = get_ib()
+    info = {"tp_qty": 0, "trail_qty": 0, "other_qty": 0, "total_qty": 0}
     try:
-        active_sell_qty = 0
         for t in ib.openTrades():
             if t.contract.conId != contract.conId:
                 continue
@@ -1282,15 +1359,35 @@ def has_protective_orders(contract: Stock, required_qty: Optional[int] = None) -
                 q = int(t.order.totalQuantity or 0)
             except (TypeError, ValueError):
                 q = 0
-            active_sell_qty += q
-
-        if required_qty is not None and required_qty > 0:
-            return active_sell_qty >= required_qty
-        return active_sell_qty > 0
+            if q <= 0:
+                continue
+            otype = (t.order.orderType or "").upper()
+            if otype == "LMT":
+                info["tp_qty"] += q
+            elif otype == "TRAIL":
+                info["trail_qty"] += q
+            else:
+                info["other_qty"] += q
+            info["total_qty"] += q
     except Exception as e:
-        log.warning(f"has_protective_orders error for {contract.symbol}: {e}")
-        # Conservative: on error, assume NOT protected so reattach path runs
-        return False
+        log.warning(f"inspect_protective_orders error for {contract.symbol}: {e}")
+    return info
+
+
+def has_protective_orders(contract: Stock, required_qty: Optional[int] = None) -> bool:
+    """
+    C4/M8: A position is "fully protected" only if BOTH an active TP (LMT
+    SELL) AND an active trailing stop (TRAIL SELL) cover at least
+    `required_qty`. Previously this counted any summed SELL qty — which
+    would falsely flag a bare TP-only or bare trail-only position as
+    protected, and would also pass through stale GTC sells from old
+    sessions.
+
+    Returns True only when BOTH legs cover the required qty.
+    """
+    info = inspect_protective_orders(contract)
+    required = required_qty if (required_qty and required_qty > 0) else 1
+    return info["tp_qty"] >= required and info["trail_qty"] >= required
 
 
 def attach_bracket_to_existing_position(
@@ -1298,15 +1395,40 @@ def attach_bracket_to_existing_position(
     trail_pct: float = DEFAULT_TRAILING_STOP,
     tp_pct: float = DEFAULT_TAKE_PROFIT
 ) -> Tuple[Optional[str], Optional[str]]:
-    # R8: pass qty so partial coverage doesn't count as protected
-    if has_protective_orders(contract, required_qty=qty):
-        log.info(f"   ℹ️  {contract.symbol} already has active protective orders "
-                 f"covering >= {qty} shares — skipping attach")
+    """
+    C4/M8: If the position is HALF-protected (TP-only or trail-only), we
+    now cancel the half-bracket and place a fresh full bracket. Only
+    fully-protected positions (both TP+trail covering qty) are skipped.
+    """
+    info = inspect_protective_orders(contract)
+    tp_covers = info["tp_qty"] >= qty
+    trail_covers = info["trail_qty"] >= qty
+
+    if tp_covers and trail_covers:
+        log.info(
+            f"   ℹ️  {contract.symbol} already has full active protection "
+            f"(TP qty={info['tp_qty']}, trail qty={info['trail_qty']} ≥ {qty}) "
+            f"— skipping attach"
+        )
         return (None, None)
+
+    if info["total_qty"] > 0:
+        # Half-protected or other-typed — cancel and replace with full bracket
+        log.warning(
+            f"   ⚠️  {contract.symbol} HALF-PROTECTED "
+            f"(tp={info['tp_qty']}, trail={info['trail_qty']}, other={info['other_qty']}, "
+            f"required={qty}) — cancelling existing SELL orders and placing fresh full bracket"
+        )
+        cancel_open_orders_for(contract)
+        # Give broker a moment to settle cancels
+        try:
+            get_ib().waitOnUpdate(timeout=0.8)
+        except Exception:
+            pass
 
     tp_trade, trail_trade = _place_child_bracket_orders(
         contract, qty, entry_ref_price, trail_pct, tp_pct,
-        oca_group_suffix=f"attach_{int(_time.time())}"
+        purpose=f"attach"
     )
     if tp_trade and trail_trade:
         log.info(f"   🛡️  Attached bracket to {contract.symbol}: "
@@ -1317,7 +1439,7 @@ def attach_bracket_to_existing_position(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  PORTFOLIO  (B1)
+#  PORTFOLIO  (B1 + C1)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_all_positions() -> Dict[str, dict]:
@@ -1334,29 +1456,18 @@ def get_all_positions() -> Dict[str, dict]:
 
 
 def get_account_summary() -> dict:
-    ib = get_ib()
-    summary = ib.accountSummary()
-    wanted = ("NetLiquidation", "TotalCashValue", "BuyingPower",
-              "UnrealizedPnL", "RealizedPnL")
-    result = {}
-    present_tags = {item.tag for item in summary}
-    for tag in wanted:
-        if tag in present_tags:
-            result[tag] = _resolve_account_value(summary, tag)
-    return result
+    """C1: Uses cycle-atomic collect_account_summary."""
+    return collect_account_summary()
 
 
 def flatten_all_positions(reason: str = "emergency") -> Dict[str, dict]:
     """
-    R10 support: returns a dict of per-symbol sell outcomes so the caller
-    (max-DD handler in global_rsi_bot) can remove ONLY confirmed-closed
-    positions from its in-memory dict. Previously this returned None and
-    the caller blindly cleared all bot_positions.
+    R10 support. Returns per-symbol sell outcomes.
 
-    Returns: { symbol: {"success": bool, "filled_qty": int,
-                        "requested_qty": int, "avg_fill_price": float|None} }
-    Any symbol NOT in the returned dict was never attempted (e.g. because
-    the flatten aborted before reaching it).
+    H7 note: only attempted symbols appear. Caller in global_rsi_bot.py
+    treats missing entries as "not found in IBKR at flatten time" — those
+    are assumed already closed (since get_all_positions was empty for
+    them) and removed from bot_positions.
     """
     log.critical(f"🚨 FLATTEN ALL triggered — reason: {reason}")
     outcomes: Dict[str, dict] = {}

@@ -4,31 +4,24 @@ __pycache__/
 *$py.class
 *.so
 .Python
-*.egg
-*.egg-info/
-dist/
 build/
+dist/
+*.egg-info/
 .pytest_cache/
-.ruff_cache/
 .mypy_cache/
+.ipynb_checkpoints/
+*.ipynb
 
-# Virtual environments
+# Environments — NEVER commit credentials
+.env
+.env.*
+!.env.example
 venv/
 .venv/
-env/
 
-# Environment files (NEVER commit real secrets)
-.env
-.env.local
-
-# Bot state — contains trade history and current positions
+# Bot state (contains live position data and trade history)
 bot_state.json
-bot_state.json.tmp
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
+bot_state.json.*
 
 # IDE
 .vscode/
@@ -36,6 +29,10 @@ Thumbs.db
 *.swp
 *.swo
 
-# Backtest outputs
-backtest_results/
-*.csv
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

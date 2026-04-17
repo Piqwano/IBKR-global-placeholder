@@ -1,0 +1,14 @@
+backtest.py
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+README.md
+bot_state.json*
+.pytest_cache
+.mypy_cache
+*.ipynb

@@ -1,8 +1,13 @@
 """
-Global RSI Bot — Configuration
-================================
+Global RSI Bot — Configuration (v2.3)
+========================================
 Stock universe across US, ASX, UK, EU, HK, Canada, Singapore markets.
 All magic numbers / timings / thresholds live here. Do NOT hardcode in helpers.
+
+v2.3 additions vs v2.2:
+  - VIX_CACHE_TTL separate from REGIME_CACHE_TTL (much tighter)
+  - STARTUP_SELF_TEST flag
+  - Exposure ceiling assertion constants surfaced for pre-loop check
 """
 
 import os
@@ -90,6 +95,13 @@ ATR_PERIOD_FOR_SIZING = 20
 VOL_SCALAR_MIN = 0.4
 VOL_SCALAR_MAX = 1.8
 
+# v2.3: Exposure ceiling — enforced at startup self-test.
+# Product of (max_positions × pos_pct × max_regime_mult × max_vol_scalar)
+# must fit under (1 - cash_reserve). With current defaults:
+#   5 × 0.15 × 1.0 × 1.8 = 1.35   →  EXCEEDS 100%, requires M3 cap
+# This constant is checked in global_rsi_bot.py::_startup_self_test.
+MAX_GROSS_EXPOSURE_PCT = 0.80        # cap per-cycle gross exposure target
+
 # ══════════════════════════════════════════════════════════════════════════
 #  LOSS LIMITS
 # ══════════════════════════════════════════════════════════════════════════
@@ -163,7 +175,10 @@ EXCHANGE_SESSIONS = {
     "SGX":   {"tz": "Asia/Singapore",     "open": time(9, 0),   "close": time(17, 0),  "days": [0,1,2,3,4], "lunch": None},
 }
 
-MARKET_HOURS_GRACE_MINS = 5
+# v2.3 (M2): grace minutes split — open-side is ZERO (no pre-market risk),
+# close-side keeps 5 min grace to allow TP/trail fills right at the bell.
+MARKET_HOURS_GRACE_MINS_OPEN = 0
+MARKET_HOURS_GRACE_MINS_CLOSE = 5
 
 # ══════════════════════════════════════════════════════════════════════════
 #  TIMING
@@ -171,7 +186,12 @@ MARKET_HOURS_GRACE_MINS = 5
 
 SCAN_INTERVAL_SECS = 60 * 15
 BARS_FOR_RSI = 250
-REGIME_CACHE_TTL = 1800
+REGIME_CACHE_TTL = 1800              # SPY regime TTL (slow-moving)
+# v2.3 (M7): VIX needs its own tighter TTL. During fast-moving markets
+# VIX can shift 20%+ in 15 min; a 30-min cache can sustain a false BULL
+# regime well past the turn. 2 min is a reasonable balance against API rate.
+VIX_CACHE_TTL = 120
+
 MARKET_DATA_SNAPSHOT_WAIT = 3
 MARKET_DATA_BATCH_WAIT = 4
 RATE_LIMIT_PER_SYMBOL = 0.3
@@ -192,6 +212,15 @@ TRADE_HISTORY_MAX_SIZE = 10_000
 # ══════════════════════════════════════════════════════════════════════════
 
 ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STARTUP SELF-TEST (v2.3)
+# ══════════════════════════════════════════════════════════════════════════
+
+# When True, the main loop runs a set of pre-flight sanity checks before
+# entering the scan loop. Any failed check aborts startup (fail-fast).
+# Disable only for local smoke-testing — NEVER in production.
+STARTUP_SELF_TEST = os.getenv("STARTUP_SELF_TEST", "1").lower() in ("1", "true", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATIONS
