@@ -108,6 +108,7 @@ If the bot restarts with IBKR positions it didn't know about (manual trades, pre
 ### Halting and resuming
 - **Daily loss limit** auto-clears at the next NY midnight rollover.
 - **Max drawdown halt** persists across restarts. To resume: set `RESET_MAX_DD=1`, restart, then unset.
+- **Operator kill-switch `HALT_NEW_BUYS=1`** — pauses new entries while letting exits, reconcile, bracket re-attach, dashboard snapshots and state persistence continue as normal. Use before FOMC, during post-incident review, or any time you want to quiesce entries without tearing the bot down. Orthogonal to the automatic daily-loss and max-drawdown halts. Flag is read at startup: set the env var and restart to engage, unset and restart to resume. Logged as `CRITICAL` in the startup banner and `WARNING` each cycle it's in effect.
 - **Manual halt**: stop the service. State is persisted and will resume cleanly.
 
 ### Investigating a halt

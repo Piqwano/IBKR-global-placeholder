@@ -247,6 +247,17 @@ DRIFT_REALERT_EVERY_CYCLES = 10
 ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════
+#  OPERATOR KILL-SWITCH  (external-review follow-up)
+# ══════════════════════════════════════════════════════════════════════════
+# When set, the main loop still runs exits, reconcile, dashboard snapshots,
+# and state saves — but scan_all_markets() is skipped and try_buy() returns
+# early. Use this to pause new-buy flow while leaving protective machinery
+# intact (e.g. pre-FOMC, after a broker notice, during manual review).
+# Orthogonal to DAILY_LOSS_LIMIT / MAX_DRAWDOWN halts — those are
+# outcome-driven; this is operator-driven.
+HALT_NEW_BUYS = os.getenv("HALT_NEW_BUYS", "").lower() in ("1", "true", "yes")
+
+# ══════════════════════════════════════════════════════════════════════════
 #  STARTUP SELF-TEST (v2.3)
 # ══════════════════════════════════════════════════════════════════════════
 

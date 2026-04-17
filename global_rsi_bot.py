@@ -57,6 +57,7 @@ from config import (
     STARTUP_SELF_TEST,
     EXTERNAL_CLOSE_TP_THRESHOLD, EXTERNAL_CLOSE_TRAIL_THRESHOLD,
     DRIFT_REALERT_EVERY_CYCLES,
+    HALT_NEW_BUYS,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -903,6 +904,13 @@ def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
 
 def try_buy(symbol: str, exchange: str, currency: str, name: str,
             analysis: dict, regime_mult: float):
+    # HALT_NEW_BUYS operator kill-switch — belt-and-braces. scan_all_markets
+    # skips the outer scan entirely, but any direct try_buy call also aborts
+    # here so the guarantee doesn't depend on scan being the only entry point.
+    if HALT_NEW_BUYS:
+        log.info(f"  ⏸️  {symbol} skip — HALT_NEW_BUYS env flag is set")
+        return
+
     with _state_lock:
         daily_halted = day_state["hit_daily_limit"]
         dd_halted = dd_state["hit_max_dd"]
@@ -1899,6 +1907,13 @@ def print_startup_banner():
     auth_label = "AUTH ✅" if DASHBOARD_AUTH_TOKEN else "⚠️  NO AUTH"
     log.info(f"   Dashboard: {'ON '+DASHBOARD_HOST+':'+str(DASHBOARD_PORT)+' ['+auth_label+']' if DASHBOARD_ENABLED else 'OFF'}")
     log.info(f"   Orphans  : ADOPT_ORPHAN={'ON — will claim' if ADOPT_ORPHAN else 'OFF — will skip (safe default)'}")
+    if HALT_NEW_BUYS:
+        log.critical(
+            "   ⏸️  HALT_NEW_BUYS=ON — all new entries paused. Exits/reconcile/"
+            "dashboard/state-save continue. Unset env var and restart to resume."
+        )
+    else:
+        log.info("   HaltBuys : OFF (HALT_NEW_BUYS unset)")
     with _state_lock:
         log.info(f"   History  : {len(trade_history)} trades loaded (cap {TRADE_HISTORY_MAX_SIZE})")
 
@@ -2129,7 +2144,12 @@ def run():
                                  f"P&L ${pnl:+.2f}{tag}")
                 check_exits()
 
-            if not halted_daily and not halted_dd:
+            if HALT_NEW_BUYS:
+                log.warning(
+                    "  ⏸️  HALT_NEW_BUYS=1 — scan skipped this cycle "
+                    "(exits/reconcile/dashboard/state-save continue as normal)"
+                )
+            elif not halted_daily and not halted_dd:
                 scan_all_markets()
 
             _push_dashboard_snapshot(
