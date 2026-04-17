@@ -225,6 +225,11 @@ def record_closed_trade(symbol: str, pos: dict,
         "opened_at": opened_at,
         "closed_at": now_iso,
         "reason": reason,
+        # External-review follow-up: propagate adoption flag onto the trade
+        # record. compute_winrates filters adopted trades out of short
+        # windows to avoid biasing recent performance with synthetic entry
+        # prices (avg_cost, not signal fills).
+        "adopted": bool(pos.get("adopted", False)),
     }
 
     with _state_lock:
@@ -243,7 +248,19 @@ def record_closed_trade(symbol: str, pos: dict,
 
 
 def compute_winrates() -> dict:
-    """R5 + H1: takes an atomic snapshot of trade_history under lock."""
+    """
+    R5 + H1: atomic snapshot of trade_history under lock.
+
+    External-review follow-up: adopted-orphan trades (entry price =
+    avg_cost, not a real signal fill) are excluded from the 24h and 7d
+    windows because their P&L attribution is noisy and would bias recent
+    performance metrics. They remain in lifetime and 30d so they still
+    show up in longer-term summaries and operators can audit them.
+
+    Returns `excluded_adopted_counts` describing how many trades were
+    dropped from each short window so the dashboard can surface the
+    exclusion count alongside winrates.
+    """
     with _state_lock:
         trade_snapshot = list(trade_history)
 
@@ -275,10 +292,18 @@ def compute_winrates() -> dict:
         wins = sum(1 for t in trades if _sanitise_float(t.get("pnl_pct")) > 0)
         return round(wins / len(trades) * 100, 1)
 
+    def _is_adopted(t: dict) -> bool:
+        return bool(t.get("adopted"))
+
     lifetime = trade_snapshot
     past_30 = [t for dt, t in parseable if dt >= cutoffs["past_30_days"]]
-    past_7 = [t for dt, t in parseable if dt >= cutoffs["past_7_days"]]
-    past_24h = [t for dt, t in parseable if dt >= cutoffs["past_24_hours"]]
+    # Short windows: drop adopted trades and count exclusions.
+    past_7_raw = [t for dt, t in parseable if dt >= cutoffs["past_7_days"]]
+    past_24h_raw = [t for dt, t in parseable if dt >= cutoffs["past_24_hours"]]
+    excluded_7d = sum(1 for t in past_7_raw if _is_adopted(t))
+    excluded_24h = sum(1 for t in past_24h_raw if _is_adopted(t))
+    past_7 = [t for t in past_7_raw if not _is_adopted(t)]
+    past_24h = [t for t in past_24h_raw if not _is_adopted(t)]
 
     return {
         "winrates": {
@@ -292,6 +317,10 @@ def compute_winrates() -> dict:
             "past_30_days": len(past_30),
             "past_7_days": len(past_7),
             "past_24_hours": len(past_24h),
+        },
+        "excluded_adopted_counts": {
+            "past_7_days": excluded_7d,
+            "past_24_hours": excluded_24h,
         },
     }
 
@@ -329,6 +358,9 @@ def save_state():
                     "opened_at": pos.get("opened_at"),
                     "trail_pct": pos.get("trail_pct"),
                     "tp_pct": pos.get("tp_pct"),
+                    # External-review follow-up: persist the adopted flag so
+                    # a restart doesn't forget an orphan was adopted.
+                    "adopted": bool(pos.get("adopted", False)),
                 }
             trade_history_snapshot = list(trade_history)
             day_state_copy = dict(day_state)
@@ -422,6 +454,9 @@ def load_state():
                 "opened_at": pos.get("opened_at"),
                 "trail_pct": pos.get("trail_pct"),
                 "tp_pct": pos.get("tp_pct"),
+                # External-review follow-up: restore adopted flag; absent
+                # in older state files → defaults to False.
+                "adopted": bool(pos.get("adopted", False)),
             }
 
         ds = payload.get("day_state", {})
@@ -1659,11 +1694,16 @@ def reconcile_existing_positions():
                 "opened_at": _utc_now_iso(),
                 "trail_pct": trail_pct,
                 "tp_pct": tp_pct,
+                # External-review follow-up: flag adopted positions so their
+                # eventual closed-trade records can be excluded from short-
+                # window winrate stats (entry price is avg_cost, not a real
+                # signal fill; P&L attribution is noisy).
+                "adopted": True,
             }
         bracket_tag = " 🛡️ bracket attached" if tp_id else " ⚠️  UNPROTECTED"
         log.warning(
             f"   ⚠️  ADOPTED ORPHAN {sym}: qty {qty} @ avg ${entry:.2f}{bracket_tag} "
-            f"(ADOPT_ORPHAN=1 was set)"
+            f"(ADOPT_ORPHAN=1 was set, marked adopted=True)"
         )
         adopted_count += 1
 
@@ -2012,6 +2052,9 @@ def _push_dashboard_snapshot(
         max_positions=MAX_POSITIONS,
         winrates=wr["winrates"],
         trade_counts=wr["counts"],
+        # External-review follow-up: surface adopted-trade exclusions so
+        # operators can see when short-window winrates had trades removed.
+        excluded_adopted_counts=wr.get("excluded_adopted_counts", {}),
         last_scan_duration_seconds=_last_scan_duration,
         last_update=_utc_now_iso(),
     )
