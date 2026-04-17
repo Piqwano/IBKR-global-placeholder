@@ -56,6 +56,7 @@ from config import (
     MAX_GROSS_EXPOSURE_PCT,
     STARTUP_SELF_TEST,
     EXTERNAL_CLOSE_TP_THRESHOLD, EXTERNAL_CLOSE_TRAIL_THRESHOLD,
+    DRIFT_REALERT_EVERY_CYCLES,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -124,10 +125,18 @@ _last_scan_duration: Optional[float] = None
 _discord_lock = threading.Lock()
 _discord_non_critical_times: deque = deque()
 
-# H-2: symbols where IBKR-qty-vs-tracked-qty drift has been alerted this
-# session. Reset when the position is fully closed so a later re-buy can
-# alert again if drift recurs.
-_qty_drift_alerted: set = set()
+# H-2: per-symbol drift state, guarded by _state_lock for consistency with
+# the rest of the shared-state pattern. Map symbol -> {
+#   "last_delta":            last alerted IBKR-qty minus tracked-qty,
+#   "cycles_since_alert":    cycles since we last sent Discord,
+# }
+# Re-alert rules:
+#   - drift magnitude changed from last alert → re-alert immediately,
+#     reset cycles_since_alert to 0.
+#   - drift magnitude unchanged → re-alert once cycles_since_alert reaches
+#     DRIFT_REALERT_EVERY_CYCLES, then reset the counter.
+# Entry removed when the position is fully closed (no drift to track).
+_qty_drift_state: Dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1243,7 +1252,7 @@ def check_exits():
                 pos = bot_positions.pop(symbol, None)
                 last_known = _last_prices.pop(symbol, None)
                 _last_price_ts.pop(symbol, None)
-            _qty_drift_alerted.discard(symbol)  # H-2: reset so next cycle can re-alert
+                _qty_drift_state.pop(symbol, None)  # H-2: reset drift tracking
             if pos:
                 _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
@@ -1252,19 +1261,46 @@ def check_exits():
         elif symbol in ibkr_positions:
             # H-2: don't blindly overwrite tracked qty. Adopt IBKR's value only
             # when it's lower (external close / external sell). A higher IBKR
-            # qty indicates drift (manual add, reconcile race) — alert once
-            # per session and KEEP tracked qty rather than silently adopting.
+            # qty indicates drift (manual add, reconcile race) — alert with the
+            # re-alert cadence defined by DRIFT_REALERT_EVERY_CYCLES so genuine
+            # unresolved drift keeps surfacing instead of going silent.
             ibkr_qty = int(ibkr_positions[symbol]["qty"])
             drift_up = False
+            current_delta = 0
+            should_alert = False
             with _state_lock:
                 if symbol not in bot_positions:
                     continue
                 tracked_qty = int(bot_positions[symbol].get("qty", 0) or 0)
                 if ibkr_qty < tracked_qty:
                     bot_positions[symbol]["qty"] = ibkr_qty
+                    # No-longer-drift: drop state so a future drift-up starts fresh.
+                    _qty_drift_state.pop(symbol, None)
                 elif ibkr_qty > tracked_qty:
                     drift_up = True
-                # else: aligned, no-op
+                    current_delta = ibkr_qty - tracked_qty
+                    prev = _qty_drift_state.get(symbol)
+                    if prev is None:
+                        should_alert = True
+                        _qty_drift_state[symbol] = {
+                            "last_delta": current_delta,
+                            "cycles_since_alert": 0,
+                        }
+                    elif prev["last_delta"] != current_delta:
+                        # Magnitude changed — re-alert immediately.
+                        should_alert = True
+                        _qty_drift_state[symbol] = {
+                            "last_delta": current_delta,
+                            "cycles_since_alert": 0,
+                        }
+                    else:
+                        prev["cycles_since_alert"] += 1
+                        if prev["cycles_since_alert"] >= DRIFT_REALERT_EVERY_CYCLES:
+                            should_alert = True
+                            prev["cycles_since_alert"] = 0
+                else:
+                    # Aligned: drop any stale drift state so alerts reset if drift recurs.
+                    _qty_drift_state.pop(symbol, None)
 
             if ibkr_qty < tracked_qty:
                 log.warning(
@@ -1277,11 +1313,10 @@ def check_exits():
                     f"drift (manual add or reconcile race). KEEPING tracked qty. "
                     f"Manual inspection required."
                 )
-                if symbol not in _qty_drift_alerted:
-                    _qty_drift_alerted.add(symbol)
+                if should_alert:
                     notify(
-                        f"🚨 {symbol} qty drift: IBKR {ibkr_qty} > tracked {tracked_qty}. "
-                        f"Keeping tracked qty. Investigate.",
+                        f"🚨 {symbol} qty drift: IBKR {ibkr_qty} > tracked {tracked_qty} "
+                        f"(delta {current_delta}). Keeping tracked qty. Investigate.",
                         critical=True,
                     )
 

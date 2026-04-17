@@ -227,6 +227,13 @@ STATE_SAVE_ON_EVERY_FILL = True
 
 TRADE_HISTORY_MAX_SIZE = 10_000
 
+# H-2 re-alert cadence: when IBKR-qty > tracked-qty drift is detected,
+# re-alert on Discord every N cycles at 15 min each (N=10 ≈ 2.5h) as long
+# as the drift persists at the same magnitude. A *changing* delta re-alerts
+# immediately regardless of cadence. Prevents the once-per-session dedup
+# that let genuine unresolved drift go silent after the first alert.
+DRIFT_REALERT_EVERY_CYCLES = 10
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ORPHAN POSITION ADOPTION
 # ══════════════════════════════════════════════════════════════════════════
