@@ -127,7 +127,14 @@ MAX_GROSS_EXPOSURE_PCT = 0.80        # cap per-cycle gross exposure target
 # ══════════════════════════════════════════════════════════════════════════
 
 DAILY_LOSS_LIMIT_PCT = 0.02
-MAX_DRAWDOWN_PCT = 0.15
+# External-review Brief #7 (c): widened 0.15 → 0.20 to give the server-side
+# bracket trails more room to handle position-level drawdowns before the
+# account-level flatten trips. At ~$800 AUD scale, a 15% DD trigger was
+# close enough to single-position gap-down risk (one 27%-of-NLV position
+# down 50% overnight → ~13.5% NLV hit) that routine volatility could flatten
+# otherwise-healthy positions and realize panic-sell commission/slippage.
+# The hard floor is preserved; it's just deeper, giving brackets first chance.
+MAX_DRAWDOWN_PCT = 0.20
 FLATTEN_ON_MAX_DD = True
 
 DAILY_RESET_TZ = os.getenv("DAILY_RESET_TZ", "America/New_York")

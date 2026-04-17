@@ -51,7 +51,7 @@ Mean-reversion RSI bot targeting ~79 stocks across US, ASX, UK, EU, HK, Canada (
 | Cash reserve floor | 20% | Buys blocked below |
 | Max commission % | 3% of position | AUD throughout |
 | Daily loss limit | 2% | Hard halt for the day |
-| Max drawdown | 15% | Flatten + halt until `RESET_MAX_DD=1` |
+| Max drawdown | 20% | Flatten + halt until `RESET_MAX_DD=1` (widened from 15% in external-review response to let brackets work first at small-account scale) |
 | Daily reset TZ | America/New_York | Design: single-TZ window across all exchanges — see below |
 | Scan interval | 15 min | |
 | SPY regime cache | 30 min | |
