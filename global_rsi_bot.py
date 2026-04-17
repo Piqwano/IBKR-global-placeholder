@@ -56,6 +56,8 @@ from config import (
     MAX_GROSS_EXPOSURE_PCT,
     STARTUP_SELF_TEST,
     EXTERNAL_CLOSE_TP_THRESHOLD, EXTERNAL_CLOSE_TRAIL_THRESHOLD,
+    DRIFT_REALERT_EVERY_CYCLES,
+    HALT_NEW_BUYS,
 )
 from ibkr_helpers import (
     get_ib, disconnect, is_connected,
@@ -124,10 +126,18 @@ _last_scan_duration: Optional[float] = None
 _discord_lock = threading.Lock()
 _discord_non_critical_times: deque = deque()
 
-# H-2: symbols where IBKR-qty-vs-tracked-qty drift has been alerted this
-# session. Reset when the position is fully closed so a later re-buy can
-# alert again if drift recurs.
-_qty_drift_alerted: set = set()
+# H-2: per-symbol drift state, guarded by _state_lock for consistency with
+# the rest of the shared-state pattern. Map symbol -> {
+#   "last_delta":            last alerted IBKR-qty minus tracked-qty,
+#   "cycles_since_alert":    cycles since we last sent Discord,
+# }
+# Re-alert rules:
+#   - drift magnitude changed from last alert → re-alert immediately,
+#     reset cycles_since_alert to 0.
+#   - drift magnitude unchanged → re-alert once cycles_since_alert reaches
+#     DRIFT_REALERT_EVERY_CYCLES, then reset the counter.
+# Entry removed when the position is fully closed (no drift to track).
+_qty_drift_state: Dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -215,6 +225,11 @@ def record_closed_trade(symbol: str, pos: dict,
         "opened_at": opened_at,
         "closed_at": now_iso,
         "reason": reason,
+        # External-review follow-up: propagate adoption flag onto the trade
+        # record. compute_winrates filters adopted trades out of short
+        # windows to avoid biasing recent performance with synthetic entry
+        # prices (avg_cost, not signal fills).
+        "adopted": bool(pos.get("adopted", False)),
     }
 
     with _state_lock:
@@ -233,7 +248,19 @@ def record_closed_trade(symbol: str, pos: dict,
 
 
 def compute_winrates() -> dict:
-    """R5 + H1: takes an atomic snapshot of trade_history under lock."""
+    """
+    R5 + H1: atomic snapshot of trade_history under lock.
+
+    External-review follow-up: adopted-orphan trades (entry price =
+    avg_cost, not a real signal fill) are excluded from the 24h and 7d
+    windows because their P&L attribution is noisy and would bias recent
+    performance metrics. They remain in lifetime and 30d so they still
+    show up in longer-term summaries and operators can audit them.
+
+    Returns `excluded_adopted_counts` describing how many trades were
+    dropped from each short window so the dashboard can surface the
+    exclusion count alongside winrates.
+    """
     with _state_lock:
         trade_snapshot = list(trade_history)
 
@@ -265,10 +292,18 @@ def compute_winrates() -> dict:
         wins = sum(1 for t in trades if _sanitise_float(t.get("pnl_pct")) > 0)
         return round(wins / len(trades) * 100, 1)
 
+    def _is_adopted(t: dict) -> bool:
+        return bool(t.get("adopted"))
+
     lifetime = trade_snapshot
     past_30 = [t for dt, t in parseable if dt >= cutoffs["past_30_days"]]
-    past_7 = [t for dt, t in parseable if dt >= cutoffs["past_7_days"]]
-    past_24h = [t for dt, t in parseable if dt >= cutoffs["past_24_hours"]]
+    # Short windows: drop adopted trades and count exclusions.
+    past_7_raw = [t for dt, t in parseable if dt >= cutoffs["past_7_days"]]
+    past_24h_raw = [t for dt, t in parseable if dt >= cutoffs["past_24_hours"]]
+    excluded_7d = sum(1 for t in past_7_raw if _is_adopted(t))
+    excluded_24h = sum(1 for t in past_24h_raw if _is_adopted(t))
+    past_7 = [t for t in past_7_raw if not _is_adopted(t)]
+    past_24h = [t for t in past_24h_raw if not _is_adopted(t)]
 
     return {
         "winrates": {
@@ -282,6 +317,10 @@ def compute_winrates() -> dict:
             "past_30_days": len(past_30),
             "past_7_days": len(past_7),
             "past_24_hours": len(past_24h),
+        },
+        "excluded_adopted_counts": {
+            "past_7_days": excluded_7d,
+            "past_24_hours": excluded_24h,
         },
     }
 
@@ -319,6 +358,9 @@ def save_state():
                     "opened_at": pos.get("opened_at"),
                     "trail_pct": pos.get("trail_pct"),
                     "tp_pct": pos.get("tp_pct"),
+                    # External-review follow-up: persist the adopted flag so
+                    # a restart doesn't forget an orphan was adopted.
+                    "adopted": bool(pos.get("adopted", False)),
                 }
             trade_history_snapshot = list(trade_history)
             day_state_copy = dict(day_state)
@@ -412,6 +454,9 @@ def load_state():
                 "opened_at": pos.get("opened_at"),
                 "trail_pct": pos.get("trail_pct"),
                 "tp_pct": pos.get("tp_pct"),
+                # External-review follow-up: restore adopted flag; absent
+                # in older state files → defaults to False.
+                "adopted": bool(pos.get("adopted", False)),
             }
 
         ds = payload.get("day_state", {})
@@ -894,6 +939,13 @@ def _apply_vol_scalar(symbol: str, base_amount: float, analysis: dict) -> float:
 
 def try_buy(symbol: str, exchange: str, currency: str, name: str,
             analysis: dict, regime_mult: float):
+    # HALT_NEW_BUYS operator kill-switch — belt-and-braces. scan_all_markets
+    # skips the outer scan entirely, but any direct try_buy call also aborts
+    # here so the guarantee doesn't depend on scan being the only entry point.
+    if HALT_NEW_BUYS:
+        log.info(f"  ⏸️  {symbol} skip — HALT_NEW_BUYS env flag is set")
+        return
+
     with _state_lock:
         daily_halted = day_state["hit_daily_limit"]
         dd_halted = dd_state["hit_max_dd"]
@@ -1243,7 +1295,7 @@ def check_exits():
                 pos = bot_positions.pop(symbol, None)
                 last_known = _last_prices.pop(symbol, None)
                 _last_price_ts.pop(symbol, None)
-            _qty_drift_alerted.discard(symbol)  # H-2: reset so next cycle can re-alert
+                _qty_drift_state.pop(symbol, None)  # H-2: reset drift tracking
             if pos:
                 _record_external_close(symbol, pos, last_known)
                 log.info(f"  {symbol}: Position closed externally (bracket or manual) — reconciled")
@@ -1252,19 +1304,46 @@ def check_exits():
         elif symbol in ibkr_positions:
             # H-2: don't blindly overwrite tracked qty. Adopt IBKR's value only
             # when it's lower (external close / external sell). A higher IBKR
-            # qty indicates drift (manual add, reconcile race) — alert once
-            # per session and KEEP tracked qty rather than silently adopting.
+            # qty indicates drift (manual add, reconcile race) — alert with the
+            # re-alert cadence defined by DRIFT_REALERT_EVERY_CYCLES so genuine
+            # unresolved drift keeps surfacing instead of going silent.
             ibkr_qty = int(ibkr_positions[symbol]["qty"])
             drift_up = False
+            current_delta = 0
+            should_alert = False
             with _state_lock:
                 if symbol not in bot_positions:
                     continue
                 tracked_qty = int(bot_positions[symbol].get("qty", 0) or 0)
                 if ibkr_qty < tracked_qty:
                     bot_positions[symbol]["qty"] = ibkr_qty
+                    # No-longer-drift: drop state so a future drift-up starts fresh.
+                    _qty_drift_state.pop(symbol, None)
                 elif ibkr_qty > tracked_qty:
                     drift_up = True
-                # else: aligned, no-op
+                    current_delta = ibkr_qty - tracked_qty
+                    prev = _qty_drift_state.get(symbol)
+                    if prev is None:
+                        should_alert = True
+                        _qty_drift_state[symbol] = {
+                            "last_delta": current_delta,
+                            "cycles_since_alert": 0,
+                        }
+                    elif prev["last_delta"] != current_delta:
+                        # Magnitude changed — re-alert immediately.
+                        should_alert = True
+                        _qty_drift_state[symbol] = {
+                            "last_delta": current_delta,
+                            "cycles_since_alert": 0,
+                        }
+                    else:
+                        prev["cycles_since_alert"] += 1
+                        if prev["cycles_since_alert"] >= DRIFT_REALERT_EVERY_CYCLES:
+                            should_alert = True
+                            prev["cycles_since_alert"] = 0
+                else:
+                    # Aligned: drop any stale drift state so alerts reset if drift recurs.
+                    _qty_drift_state.pop(symbol, None)
 
             if ibkr_qty < tracked_qty:
                 log.warning(
@@ -1277,11 +1356,10 @@ def check_exits():
                     f"drift (manual add or reconcile race). KEEPING tracked qty. "
                     f"Manual inspection required."
                 )
-                if symbol not in _qty_drift_alerted:
-                    _qty_drift_alerted.add(symbol)
+                if should_alert:
                     notify(
-                        f"🚨 {symbol} qty drift: IBKR {ibkr_qty} > tracked {tracked_qty}. "
-                        f"Keeping tracked qty. Investigate.",
+                        f"🚨 {symbol} qty drift: IBKR {ibkr_qty} > tracked {tracked_qty} "
+                        f"(delta {current_delta}). Keeping tracked qty. Investigate.",
                         critical=True,
                     )
 
@@ -1616,11 +1694,16 @@ def reconcile_existing_positions():
                 "opened_at": _utc_now_iso(),
                 "trail_pct": trail_pct,
                 "tp_pct": tp_pct,
+                # External-review follow-up: flag adopted positions so their
+                # eventual closed-trade records can be excluded from short-
+                # window winrate stats (entry price is avg_cost, not a real
+                # signal fill; P&L attribution is noisy).
+                "adopted": True,
             }
         bracket_tag = " 🛡️ bracket attached" if tp_id else " ⚠️  UNPROTECTED"
         log.warning(
             f"   ⚠️  ADOPTED ORPHAN {sym}: qty {qty} @ avg ${entry:.2f}{bracket_tag} "
-            f"(ADOPT_ORPHAN=1 was set)"
+            f"(ADOPT_ORPHAN=1 was set, marked adopted=True)"
         )
         adopted_count += 1
 
@@ -1767,6 +1850,44 @@ def _startup_self_test() -> bool:
         )
         checks_passed = False
 
+    # 11. Cash-reserve + gross-exposure mutual-satisfiability invariant
+    # (external-review follow-up). A buy must satisfy BOTH:
+    #   - gross exposure ≤ MAX_GROSS_EXPOSURE_PCT * NLV
+    #   - cash ≥ CASH_RESERVE_PCT * NLV
+    # Gross + cash ≤ NLV (ignoring margin), so the policy is only coherent
+    # when CASH_RESERVE_PCT + MAX_GROSS_EXPOSURE_PCT ≤ 1.0. If a future
+    # edit drifts these apart (e.g. cash=0.25, gross=0.80 = 1.05), the
+    # bot silently can't deploy its full budget. Hard-fail at startup.
+    invariant = CASH_RESERVE_PCT + MAX_GROSS_EXPOSURE_PCT
+    if invariant > 1.0 + 1e-9:
+        log.critical(
+            f"  ❌ CASH_RESERVE_PCT ({CASH_RESERVE_PCT:.2f}) + "
+            f"MAX_GROSS_EXPOSURE_PCT ({MAX_GROSS_EXPOSURE_PCT:.2f}) = "
+            f"{invariant:.2f} > 1.00 — mutually unsatisfiable. "
+            f"Reduce one to keep the sum ≤ 1.0."
+        )
+        checks_passed = False
+    else:
+        log.info(
+            f"  ✅ Cash+exposure invariant: {CASH_RESERVE_PCT:.2f} + "
+            f"{MAX_GROSS_EXPOSURE_PCT:.2f} = {invariant:.2f} ≤ 1.00"
+        )
+
+    # 10. DAILY_RESET_TZ parseable via ZoneInfo (external-review follow-up).
+    # _today_in_reset_tz() calls ZoneInfo(DAILY_RESET_TZ) every cycle; a typo
+    # would raise ZoneInfoNotFoundError mid-loop on the first day-roll, not
+    # at startup. Fail fast instead.
+    try:
+        _ = ZoneInfo(DAILY_RESET_TZ)
+        log.info(f"  ✅ DAILY_RESET_TZ={DAILY_RESET_TZ!r} parses via ZoneInfo")
+    except Exception as e:
+        log.critical(
+            f"  ❌ DAILY_RESET_TZ={DAILY_RESET_TZ!r} not a valid IANA tz "
+            f"({type(e).__name__}: {e}). Examples: America/New_York, "
+            f"Australia/Sydney, Europe/London."
+        )
+        checks_passed = False
+
     # 9. L-6: Discord webhook format check (soft). Malformed webhooks silently
     # 404 per-post and operators miss critical alerts.
     if DISCORD_WEBHOOK:
@@ -1826,6 +1947,13 @@ def print_startup_banner():
     auth_label = "AUTH ✅" if DASHBOARD_AUTH_TOKEN else "⚠️  NO AUTH"
     log.info(f"   Dashboard: {'ON '+DASHBOARD_HOST+':'+str(DASHBOARD_PORT)+' ['+auth_label+']' if DASHBOARD_ENABLED else 'OFF'}")
     log.info(f"   Orphans  : ADOPT_ORPHAN={'ON — will claim' if ADOPT_ORPHAN else 'OFF — will skip (safe default)'}")
+    if HALT_NEW_BUYS:
+        log.critical(
+            "   ⏸️  HALT_NEW_BUYS=ON — all new entries paused. Exits/reconcile/"
+            "dashboard/state-save continue. Unset env var and restart to resume."
+        )
+    else:
+        log.info("   HaltBuys : OFF (HALT_NEW_BUYS unset)")
     with _state_lock:
         log.info(f"   History  : {len(trade_history)} trades loaded (cap {TRADE_HISTORY_MAX_SIZE})")
 
@@ -1924,6 +2052,9 @@ def _push_dashboard_snapshot(
         max_positions=MAX_POSITIONS,
         winrates=wr["winrates"],
         trade_counts=wr["counts"],
+        # External-review follow-up: surface adopted-trade exclusions so
+        # operators can see when short-window winrates had trades removed.
+        excluded_adopted_counts=wr.get("excluded_adopted_counts", {}),
         last_scan_duration_seconds=_last_scan_duration,
         last_update=_utc_now_iso(),
     )
@@ -2056,7 +2187,12 @@ def run():
                                  f"P&L ${pnl:+.2f}{tag}")
                 check_exits()
 
-            if not halted_daily and not halted_dd:
+            if HALT_NEW_BUYS:
+                log.warning(
+                    "  ⏸️  HALT_NEW_BUYS=1 — scan skipped this cycle "
+                    "(exits/reconcile/dashboard/state-save continue as normal)"
+                )
+            elif not halted_daily and not halted_dd:
                 scan_all_markets()
 
             _push_dashboard_snapshot(

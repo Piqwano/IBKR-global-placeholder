@@ -59,6 +59,7 @@ _state: Dict[str, Any] = {
     "max_positions": 0,
     "winrates": {},
     "trade_counts": {},
+    "excluded_adopted_counts": {},
     "last_scan_duration_seconds": None,
     "last_update": None,
     "recent_trades": [],
@@ -162,6 +163,10 @@ def _build_app() -> "FastAPI":
         return {
             "winrates": snap.get("winrates", {}),
             "counts": snap.get("trade_counts", {}),
+            # Trades excluded from short-window winrates because the
+            # position was adopted via ADOPT_ORPHAN (entry = avg_cost,
+            # not a real signal fill). Lifetime + 30d are unaffected.
+            "excluded_adopted_counts": snap.get("excluded_adopted_counts", {}),
             "last_update": snap.get("last_update"),
         }
 

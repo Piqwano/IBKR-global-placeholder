@@ -78,12 +78,18 @@ USE_BRACKET_ORDERS = True
 REPAIR_TP_AFTER_FILL = True
 REATTACH_BRACKETS_ON_RECONCILE = True
 
-# L-4: External-close classifier thresholds. These decide how an exit that
-# happened without the bot's sell action (bracket fire, manual close) is
-# labelled in trade_history. Tune if desired — the defaults correspond to
-# "within 5% of TP" and "at least half the trail distance down".
-EXTERNAL_CLOSE_TP_THRESHOLD = 0.95   # ret/tp_pct ≥ this → "take_profit"
-EXTERNAL_CLOSE_TRAIL_THRESHOLD = 0.5 # ret ≤ -trail_pct × this → "trailing_stop"
+# L-4 / external-review follow-up: External-close classifier thresholds.
+# These decide how an exit that happened without the bot's sell action
+# (bracket fire, manual close) is labelled in trade_history.
+#
+# TP threshold: default 0.95 → "within 5% of TP" still counts as take_profit.
+# TRAIL threshold: tightened from 0.5 → 0.75 so a shallow -3% exit on a 6%
+# trail no longer gets attributed as trailing_stop. At 0.75 the exit must be
+# at least three-quarters of the trail distance (e.g. -4.5% on a 6% trail)
+# before we call it trailing_stop; the ambiguous middle stays as
+# "bracket_exit" — accurate rather than optimistic.
+EXTERNAL_CLOSE_TP_THRESHOLD = 0.95    # ret/tp_pct ≥ this → "take_profit"
+EXTERNAL_CLOSE_TRAIL_THRESHOLD = 0.75 # ret ≤ -trail_pct × this → "trailing_stop"
 
 # ══════════════════════════════════════════════════════════════════════════
 #  POSITION SIZING (base)
@@ -121,7 +127,14 @@ MAX_GROSS_EXPOSURE_PCT = 0.80        # cap per-cycle gross exposure target
 # ══════════════════════════════════════════════════════════════════════════
 
 DAILY_LOSS_LIMIT_PCT = 0.02
-MAX_DRAWDOWN_PCT = 0.15
+# External-review Brief #7 (c): widened 0.15 → 0.20 to give the server-side
+# bracket trails more room to handle position-level drawdowns before the
+# account-level flatten trips. At ~$800 AUD scale, a 15% DD trigger was
+# close enough to single-position gap-down risk (one 27%-of-NLV position
+# down 50% overnight → ~13.5% NLV hit) that routine volatility could flatten
+# otherwise-healthy positions and realize panic-sell commission/slippage.
+# The hard floor is preserved; it's just deeper, giving brackets first chance.
+MAX_DRAWDOWN_PCT = 0.20
 FLATTEN_ON_MAX_DD = True
 
 DAILY_RESET_TZ = os.getenv("DAILY_RESET_TZ", "America/New_York")
@@ -227,11 +240,29 @@ STATE_SAVE_ON_EVERY_FILL = True
 
 TRADE_HISTORY_MAX_SIZE = 10_000
 
+# H-2 re-alert cadence: when IBKR-qty > tracked-qty drift is detected,
+# re-alert on Discord every N cycles at 15 min each (N=10 ≈ 2.5h) as long
+# as the drift persists at the same magnitude. A *changing* delta re-alerts
+# immediately regardless of cadence. Prevents the once-per-session dedup
+# that let genuine unresolved drift go silent after the first alert.
+DRIFT_REALERT_EVERY_CYCLES = 10
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ORPHAN POSITION ADOPTION
 # ══════════════════════════════════════════════════════════════════════════
 
 ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  OPERATOR KILL-SWITCH  (external-review follow-up)
+# ══════════════════════════════════════════════════════════════════════════
+# When set, the main loop still runs exits, reconcile, dashboard snapshots,
+# and state saves — but scan_all_markets() is skipped and try_buy() returns
+# early. Use this to pause new-buy flow while leaving protective machinery
+# intact (e.g. pre-FOMC, after a broker notice, during manual review).
+# Orthogonal to DAILY_LOSS_LIMIT / MAX_DRAWDOWN halts — those are
+# outcome-driven; this is operator-driven.
+HALT_NEW_BUYS = os.getenv("HALT_NEW_BUYS", "").lower() in ("1", "true", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  STARTUP SELF-TEST (v2.3)
