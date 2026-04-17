@@ -37,12 +37,17 @@ RECONNECT_BACKOFF_FACTOR = 2.0
 RECONNECT_MAX_ATTEMPTS = 0           # 0 = infinite
 
 CONNECTION_TIMEOUT = 15
-TRADE_FILL_TIMEOUT = 30
+# M-9: bumped from 30→60s. SEHK small-caps, SGX non-blue-chips and
+# low-volume ASX miners routinely take >30s to fully fill a market order;
+# the old timeout forced us into the partial-fill re-attach path too often.
+TRADE_FILL_TIMEOUT = 60
 
 # Post-placement verification — poll order status this long (seconds) to
 # confirm a new/amended order actually became active before returning
-# success to the caller. See R9.
-ORDER_PLACEMENT_VERIFY_SECS = 2.0
+# success to the caller. See R9. Bumped from 2→5s in ultrareview (H-4):
+# under market-open bursts IBKR status ACKs frequently delay >2s and were
+# causing false "unverified" cancellations of perfectly valid orders.
+ORDER_PLACEMENT_VERIFY_SECS = 5.0
 
 # ══════════════════════════════════════════════════════════════════════════
 #  STRATEGY — RSI
@@ -65,11 +70,20 @@ DEFAULT_TAKE_PROFIT = 0.08
 
 USE_ATR_STOPS = False
 ATR_PERIOD = 14
+# L-5: no-op unless USE_ATR_STOPS=True. Kept here so the parameter is in
+# one place if/when ATR stops are re-enabled.
 ATR_MULTIPLIER = 1.5
 
 USE_BRACKET_ORDERS = True
 REPAIR_TP_AFTER_FILL = True
 REATTACH_BRACKETS_ON_RECONCILE = True
+
+# L-4: External-close classifier thresholds. These decide how an exit that
+# happened without the bot's sell action (bracket fire, manual close) is
+# labelled in trade_history. Tune if desired — the defaults correspond to
+# "within 5% of TP" and "at least half the trail distance down".
+EXTERNAL_CLOSE_TP_THRESHOLD = 0.95   # ret/tp_pct ≥ this → "take_profit"
+EXTERNAL_CLOSE_TRAIL_THRESHOLD = 0.5 # ret ≤ -trail_pct × this → "trailing_stop"
 
 # ══════════════════════════════════════════════════════════════════════════
 #  POSITION SIZING (base)
@@ -191,6 +205,12 @@ REGIME_CACHE_TTL = 1800              # SPY regime TTL (slow-moving)
 # VIX can shift 20%+ in 15 min; a 30-min cache can sustain a false BULL
 # regime well past the turn. 2 min is a reasonable balance against API rate.
 VIX_CACHE_TTL = 120
+
+# C-1: FX rate cache. Major pairs move <0.5% intraday; 10 min is a sensible
+# balance between API calls and sizing precision. Revisit during high-vol
+# macro events (FOMC, NFP).
+FX_CACHE_TTL = 600
+FX_SNAPSHOT_WAIT = 3
 
 MARKET_DATA_SNAPSHOT_WAIT = 3
 MARKET_DATA_BATCH_WAIT = 4
