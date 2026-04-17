@@ -78,12 +78,18 @@ USE_BRACKET_ORDERS = True
 REPAIR_TP_AFTER_FILL = True
 REATTACH_BRACKETS_ON_RECONCILE = True
 
-# L-4: External-close classifier thresholds. These decide how an exit that
-# happened without the bot's sell action (bracket fire, manual close) is
-# labelled in trade_history. Tune if desired — the defaults correspond to
-# "within 5% of TP" and "at least half the trail distance down".
-EXTERNAL_CLOSE_TP_THRESHOLD = 0.95   # ret/tp_pct ≥ this → "take_profit"
-EXTERNAL_CLOSE_TRAIL_THRESHOLD = 0.5 # ret ≤ -trail_pct × this → "trailing_stop"
+# L-4 / external-review follow-up: External-close classifier thresholds.
+# These decide how an exit that happened without the bot's sell action
+# (bracket fire, manual close) is labelled in trade_history.
+#
+# TP threshold: default 0.95 → "within 5% of TP" still counts as take_profit.
+# TRAIL threshold: tightened from 0.5 → 0.75 so a shallow -3% exit on a 6%
+# trail no longer gets attributed as trailing_stop. At 0.75 the exit must be
+# at least three-quarters of the trail distance (e.g. -4.5% on a 6% trail)
+# before we call it trailing_stop; the ambiguous middle stays as
+# "bracket_exit" — accurate rather than optimistic.
+EXTERNAL_CLOSE_TP_THRESHOLD = 0.95    # ret/tp_pct ≥ this → "take_profit"
+EXTERNAL_CLOSE_TRAIL_THRESHOLD = 0.75 # ret ≤ -trail_pct × this → "trailing_stop"
 
 # ══════════════════════════════════════════════════════════════════════════
 #  POSITION SIZING (base)
