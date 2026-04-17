@@ -11,10 +11,19 @@ Fill modes (config.BACKTEST_FILL_MODE):
 Realistic costs: per-exchange commission + per-exchange bps slippage,
 tracked symmetrically on entry AND exit.
 
+FX-aware (external-review follow-up): positions are priced in their
+native currency; cash, equity, and reported P&L are in the chosen base
+currency (--base-currency USD|AUD, default USD). Non-base currencies
+pull FX series from yfinance (AUDUSD=X etc.), forward-filled across
+weekends/holidays. Commissions are assumed to already be in the base
+currency, matching the live bot's convention. If your base is not USD
+or AUD, verify the EXCHANGE_COMMISSIONS constants make sense for it.
+
 Run:
     python backtest.py                                   # 3-year backtest
     python backtest.py --start 2020-01-01 --end 2024-12-31
     python backtest.py --capital 10000 --symbols AAPL MSFT NVDA
+    python backtest.py --base-currency USD              # or AUD
 """
 
 import argparse
@@ -67,6 +76,80 @@ def yf_ticker(symbol: str, exchange: str) -> str:
     if exchange == "SEHK":
         return f"{int(symbol):04d}.HK"
     return symbol.replace(".", "-") + YF_SUFFIX.get(exchange, "")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FX DATA (external-review follow-up: FX-aware P&L)
+# ══════════════════════════════════════════════════════════════════════════
+
+def yf_fx_ticker(from_ccy: str, to_ccy: str) -> str:
+    """yfinance FX ticker: 'AUDUSD=X' means USD per 1 AUD."""
+    return f"{from_ccy}{to_ccy}=X"
+
+
+def load_fx_data(base_ccy: str, currencies: List[str],
+                 start: str, end: str,
+                 trading_index: Optional[pd.DatetimeIndex] = None
+                 ) -> Dict[str, pd.Series]:
+    """
+    Return {ccy: Series[date → rate(ccy→base_ccy)]}.
+    Base currency maps to a constant 1.0 series. Non-base pairs pull
+    yfinance FX and are forward-filled across weekends/holidays so every
+    trading date has a valid rate.
+
+    If a pair fails to load, fall back to a constant 1.0 series and log a
+    loud warning — the backtest will still run but P&L for that currency
+    won't be FX-corrected.
+    """
+    rates: Dict[str, pd.Series] = {}
+    needed = {c for c in currencies if c and c != base_ccy}
+
+    # Helper: build a trading-day index if one wasn't provided
+    if trading_index is None:
+        # Approximate — 5-day business days between start and end
+        trading_index = pd.bdate_range(start=start, end=end)
+
+    for ccy in needed:
+        tkr = yf_fx_ticker(ccy, base_ccy)
+        try:
+            fx = yf.download(tkr, start=start, end=end, progress=False, auto_adjust=True)
+            if fx.empty:
+                raise ValueError("empty FX dataframe")
+            if isinstance(fx.columns, pd.MultiIndex):
+                fx.columns = fx.columns.get_level_values(0)
+            fx.columns = [c.lower() for c in fx.columns]
+            series = fx["close"].astype(float)
+            # Reindex onto trading_index, forward-fill across missing days
+            series = series.reindex(trading_index).ffill().bfill()
+            if series.isna().any():
+                raise ValueError("FX series has unfillable NaNs")
+            rates[ccy] = series
+            print(f"   ✅ FX {ccy}→{base_ccy}: {len(series)} days, last rate {series.iloc[-1]:.4f}")
+        except Exception as e:
+            print(
+                f"   ⚠️  FX {ccy}→{base_ccy} ({tkr}) failed: {e} — "
+                f"falling back to 1.0 (P&L for {ccy} positions WILL BE WRONG)"
+            )
+            rates[ccy] = pd.Series(1.0, index=trading_index)
+
+    # Base currency is always 1.0 vs itself
+    rates[base_ccy] = pd.Series(1.0, index=trading_index)
+    return rates
+
+
+def fx_rate(rates: Dict[str, pd.Series], ccy: str, date: pd.Timestamp) -> float:
+    """Lookup rate; fall back to 1.0 if ccy or date missing (shouldn't happen
+    after load_fx_data ffill, but defensive)."""
+    s = rates.get(ccy)
+    if s is None:
+        return 1.0
+    if date in s.index:
+        return float(s.loc[date])
+    # Use the last-known rate before `date`
+    prior = s.loc[:date]
+    if len(prior) == 0:
+        return 1.0
+    return float(prior.iloc[-1])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -158,15 +241,16 @@ def load_regime_data(start: str, end: str) -> pd.DataFrame:
 class Position:
     symbol: str
     exchange: str
+    currency: str                  # native contract ccy; prices below are in this ccy
     entry_date: pd.Timestamp
-    entry_price: float
+    entry_price: float             # native currency
     qty: int
-    peak: float
+    peak: float                    # native currency
     trailing_stop_pct: float
     take_profit_pct: float
     rsi_exit: float
-    entry_commission: float
-    entry_slippage: float
+    entry_commission: float        # base currency (assumed; see module docstring)
+    entry_slippage: float          # base currency
 
     def current_stop(self) -> float:
         return self.peak * (1 - self.trailing_stop_pct)
@@ -193,7 +277,14 @@ class Trade:
 
 @dataclass
 class Backtester:
+    """
+    cash, equity_curve, trade.pnl, peak_equity, day_start_equity are all
+    in BASE currency. Position.entry_price/peak are in NATIVE currency.
+    Conversions happen at open, mark-to-market, and close via fx_rates.
+    """
     starting_capital: float
+    base_currency: str = "USD"
+    fx_rates: Dict[str, pd.Series] = field(default_factory=dict)
     fill_mode: str = "next_open"
     cash: float = 0.0
     positions: Dict[str, Position] = field(default_factory=dict)
@@ -210,7 +301,20 @@ class Backtester:
         self.peak_equity = self.starting_capital
         self.day_start_equity = self.starting_capital
 
+    # ── FX helpers ────────────────────────────────────────────────────
+    def fx(self, ccy: str, date: pd.Timestamp) -> float:
+        """Rate converting 1 unit of `ccy` into base currency on `date`."""
+        return fx_rate(self.fx_rates, ccy, date)
+
+    def native_to_base(self, native_amount: float, ccy: str, date: pd.Timestamp) -> float:
+        return native_amount * self.fx(ccy, date)
+
+    def base_to_native(self, base_amount: float, ccy: str, date: pd.Timestamp) -> float:
+        rate = self.fx(ccy, date)
+        return base_amount / rate if rate > 0 else base_amount
+
     def calc_qty(self, exchange: str, symbol: str, amount: float, price: float) -> int:
+        """amount and price both in native currency."""
         if exchange == "SGX":
             return ((int(amount / price)) // 100) * 100
         if exchange == "SEHK":
@@ -218,65 +322,102 @@ class Backtester:
             return ((int(amount / price)) // lot) * lot
         return int(amount / price)
 
-    def costs(self, exchange: str, notional: float) -> Tuple[float, float]:
-        commission = EXCHANGE_COMMISSIONS.get(exchange, 5.0)
-        slippage = notional * (SLIPPAGE_BPS.get(exchange, 10) / 10_000)
-        return commission, slippage
+    def costs(self, exchange: str, notional_native: float, ccy: str,
+              date: pd.Timestamp) -> Tuple[float, float]:
+        """
+        Commission: assumed in BASE currency (matches live/README convention).
+        Slippage: computed from notional which is converted to base here.
+        Returns (commission_base, slippage_base).
+        """
+        commission_base = EXCHANGE_COMMISSIONS.get(exchange, 5.0)
+        notional_base = self.native_to_base(notional_native, ccy, date)
+        slippage_base = notional_base * (SLIPPAGE_BPS.get(exchange, 10) / 10_000)
+        return commission_base, slippage_base
 
     def mark_to_market(self, data: Dict[str, pd.DataFrame], today: pd.Timestamp) -> float:
+        """Sum of cash (base) + each position value in native × FX rate to base."""
         equity = self.cash
         for sym, pos in self.positions.items():
             df = data.get(sym)
             if df is not None and today in df.index:
-                equity += pos.qty * df.loc[today, "close"]
+                native_value = pos.qty * df.loc[today, "close"]
             else:
-                equity += pos.qty * pos.entry_price
+                native_value = pos.qty * pos.entry_price
+            equity += self.native_to_base(native_value, pos.currency, today)
         return equity
 
-    def open_position(self, symbol: str, exchange: str, day: pd.Timestamp,
-                      fill_price: float, amount: float, cfg: dict) -> bool:
-        qty = self.calc_qty(exchange, symbol, amount, fill_price)
+    def open_position(self, symbol: str, exchange: str, currency: str,
+                      day: pd.Timestamp,
+                      fill_price_native: float, amount_base: float,
+                      cfg: dict) -> bool:
+        """
+        fill_price_native: price of the stock in its native currency
+        amount_base: target investment amount in BASE currency
+        """
+        # Convert the target base-amount into native for quantity calc
+        amount_native = self.base_to_native(amount_base, currency, day)
+        qty = self.calc_qty(exchange, symbol, amount_native, fill_price_native)
         if qty < 1:
             return False
-        notional = qty * fill_price
-        commission, slippage = self.costs(exchange, notional)
-        effective_price = fill_price * (1 + SLIPPAGE_BPS.get(exchange, 10) / 10_000)
-        total_cost = qty * effective_price + commission
-        if total_cost > self.cash:
+
+        notional_native = qty * fill_price_native
+        commission_base, slippage_base = self.costs(exchange, notional_native, currency, day)
+
+        # Apply slippage in native units (price moves against us)
+        slippage_mult = 1 + SLIPPAGE_BPS.get(exchange, 10) / 10_000
+        effective_price_native = fill_price_native * slippage_mult
+
+        # Total cost in BASE: (qty × effective_native × fx) + commission_base
+        total_cost_base = self.native_to_base(qty * effective_price_native, currency, day) + commission_base
+        if total_cost_base > self.cash:
             return False
 
-        self.cash -= total_cost
+        self.cash -= total_cost_base
         self.positions[symbol] = Position(
-            symbol=symbol, exchange=exchange,
-            entry_date=day, entry_price=effective_price,
-            qty=qty, peak=effective_price,
+            symbol=symbol, exchange=exchange, currency=currency,
+            entry_date=day, entry_price=effective_price_native,
+            qty=qty, peak=effective_price_native,
             trailing_stop_pct=cfg["trailing_stop"],
             take_profit_pct=cfg["take_profit"],
             rsi_exit=cfg["rsi_exit"],
-            entry_commission=commission,
-            entry_slippage=slippage,
+            entry_commission=commission_base,
+            entry_slippage=slippage_base,
         )
         return True
 
-    def close_position(self, symbol: str, day: pd.Timestamp, price: float, reason: str):
+    def close_position(self, symbol: str, day: pd.Timestamp,
+                       price_native: float, reason: str):
         pos = self.positions.pop(symbol)
-        notional = pos.qty * price
-        commission, slippage = self.costs(pos.exchange, notional)
-        effective_price = price * (1 - SLIPPAGE_BPS.get(pos.exchange, 10) / 10_000)
-        proceeds = pos.qty * effective_price - commission
-        self.cash += proceeds
+        notional_native = pos.qty * price_native
+        commission_base, slippage_base = self.costs(pos.exchange, notional_native, pos.currency, day)
 
-        pnl = proceeds - (pos.qty * pos.entry_price) - pos.entry_commission
-        pnl_pct = (effective_price - pos.entry_price) / pos.entry_price * 100
+        slippage_mult = 1 - SLIPPAGE_BPS.get(pos.exchange, 10) / 10_000
+        effective_price_native = price_native * slippage_mult
+
+        proceeds_base = self.native_to_base(pos.qty * effective_price_native, pos.currency, day) - commission_base
+        self.cash += proceeds_base
+
+        # PnL attribution in base currency.
+        #  - entry cost base: qty × entry_price_native × fx(entry_date) + entry_commission_base
+        #  - exit proceeds base: proceeds_base (already net of exit commission)
+        #  - pnl_base = exit_proceeds - entry_cost
+        entry_cost_base = (
+            self.native_to_base(pos.qty * pos.entry_price, pos.currency, pos.entry_date)
+            + pos.entry_commission
+        )
+        pnl = proceeds_base - entry_cost_base
+
+        # pnl_pct is still meaningful as a NATIVE-price return — independent of FX.
+        pnl_pct = (effective_price_native - pos.entry_price) / pos.entry_price * 100
 
         self.trades.append(Trade(
             symbol=symbol, exchange=pos.exchange,
             entry_date=pos.entry_date, exit_date=day,
-            entry_price=pos.entry_price, exit_price=effective_price,
+            entry_price=pos.entry_price, exit_price=effective_price_native,
             qty=pos.qty, pnl=pnl, pnl_pct=pnl_pct,
             reason=reason,
-            commission=pos.entry_commission + commission,
-            slippage=pos.entry_slippage + slippage,
+            commission=pos.entry_commission + commission_base,
+            slippage=pos.entry_slippage + slippage_base,
         ))
 
 
@@ -285,10 +426,17 @@ class Backtester:
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
+                 fx_rates: Dict[str, pd.Series],
                  starting_capital: float,
+                 base_currency: str = "USD",
                  fill_mode: str = BACKTEST_FILL_MODE) -> Backtester:
 
-    bt = Backtester(starting_capital=starting_capital, fill_mode=fill_mode)
+    bt = Backtester(
+        starting_capital=starting_capital,
+        base_currency=base_currency,
+        fx_rates=fx_rates,
+        fill_mode=fill_mode,
+    )
 
     all_dates = set(regime_df.index)
     for df in data.values():
@@ -314,7 +462,10 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 fill_price = float(df.loc[today, "open"])
                 if math.isnan(fill_price):
                     continue
-                bt.open_position(sym, pe["exchange"], today, fill_price, pe["amount"], pe["cfg"])
+                bt.open_position(
+                    sym, pe["exchange"], pe["currency"], today,
+                    fill_price, pe["amount"], pe["cfg"],
+                )
             bt.pending_entries = []
 
         # ── 1. Check exits on open positions ──────────────────────────────
@@ -418,6 +569,7 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 cfg["trailing_stop"] = max(cfg["trailing_stop"], atr_pct)
 
             exchange = df["exchange"].iloc[0]
+            currency = df["currency"].iloc[0]
             est_comm = EXCHANGE_COMMISSIONS.get(exchange, 10)
             if est_comm / amount > 0.03:
                 continue
@@ -427,12 +579,12 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 if pd.isna(next_open):
                     continue
                 bt.pending_entries.append({
-                    "symbol": sym, "exchange": exchange,
+                    "symbol": sym, "exchange": exchange, "currency": currency,
                     "amount": amount, "cfg": cfg,
                 })
                 pending_symbols.add(sym)
             else:
-                bt.open_position(sym, exchange, today, price, amount, cfg)
+                bt.open_position(sym, exchange, currency, today, price, amount, cfg)
 
     return bt
 
@@ -472,13 +624,15 @@ def print_metrics(bt: Backtester):
     total_comm = sum(t.commission for t in bt.trades)
     total_slip = sum(t.slippage for t in bt.trades)
 
+    base = bt.base_currency
     print("\n" + "═" * 72)
     print("  📊 BACKTEST RESULTS")
     print("═" * 72)
     print(f"  Period          : {dates[0].date()} → {dates[-1].date()} ({years:.2f} yrs)")
     print(f"  Fill mode       : {bt.fill_mode}")
-    print(f"  Starting capital: ${bt.starting_capital:,.2f}")
-    print(f"  Ending capital  : ${final:,.2f}")
+    print(f"  Base currency   : {base} (all P&L / equity / cash denominated here)")
+    print(f"  Starting capital: {base} {bt.starting_capital:,.2f}")
+    print(f"  Ending capital  : {base} {final:,.2f}")
     print(f"  Total return    : {total_return:+.2f}%")
     print(f"  CAGR            : {cagr:+.2f}%")
     print(f"  Sharpe (ann.)   : {sharpe:.2f}")
@@ -486,12 +640,12 @@ def print_metrics(bt: Backtester):
     print()
     print(f"  Trades          : {len(bt.trades)}")
     print(f"  Win rate        : {win_rate:.1f}%")
-    print(f"  Avg win         : {avg_win:+.2f}%")
-    print(f"  Avg loss        : {avg_loss:+.2f}%")
+    print(f"  Avg win         : {avg_win:+.2f}%  (native-price return, FX-independent)")
+    print(f"  Avg loss        : {avg_loss:+.2f}%  (native-price return, FX-independent)")
     print(f"  Profit factor   : {profit_factor:.2f}")
     print()
-    print(f"  Total commission: ${total_comm:,.2f}  (entry + exit)")
-    print(f"  Total slippage  : ${total_slip:,.2f}  (entry + exit)")
+    print(f"  Total commission: {base} {total_comm:,.2f}  (entry + exit)")
+    print(f"  Total slippage  : {base} {total_slip:,.2f}  (entry + exit)")
     print("═" * 72)
 
     print("\n  Exit reason breakdown:")
@@ -545,6 +699,9 @@ def main():
     parser.add_argument("--us-only", action="store_true")
     parser.add_argument("--fill-mode", choices=["next_open", "same_close"],
                         default=BACKTEST_FILL_MODE)
+    parser.add_argument("--base-currency", default="USD",
+                        help="Base currency for cash/equity/P&L (e.g. USD, AUD). "
+                             "Non-base currencies pull FX from yfinance.")
     args = parser.parse_args()
 
     universe = STOCK_UNIVERSE
@@ -554,9 +711,11 @@ def main():
         wanted = set(args.symbols)
         universe = [u for u in universe if u[0] in wanted]
 
-    print(f"🧪 Backtest | {args.start} → {args.end} | ${args.capital:,.0f} starting capital")
+    base_ccy = args.base_currency.upper()
+    print(f"🧪 Backtest | {args.start} → {args.end} | {base_ccy} {args.capital:,.0f} starting capital")
     print(f"   Universe : {len(universe)} symbols")
     print(f"   Fill mode: {args.fill_mode}")
+    print(f"   Base ccy : {base_ccy}")
     print(f"   Filters  : Vol={USE_VOLUME_FILTER} Trend200={USE_TREND_FILTER} MA20={USE_MA20_FILTER}")
     print(f"   ATR stops: {USE_ATR_STOPS} (mult={ATR_MULTIPLIER})")
     print()
@@ -566,8 +725,20 @@ def main():
         print("No data loaded.")
         sys.exit(1)
 
+    # Build a trading-day index from the union of all loaded symbols — FX data
+    # will be reindexed onto this so every trading day has a valid rate.
+    union_idx = sorted({d for df in data.values() for d in df.index})
+    trading_idx = pd.DatetimeIndex(union_idx) if union_idx else None
+
+    currencies_in_universe = sorted({u[2] for u in universe})
+    print(f"   Currencies in universe: {currencies_in_universe}")
+    print(f"📥 Loading FX rates → {base_ccy}...")
+    fx_rates = load_fx_data(base_ccy, currencies_in_universe,
+                             args.start, args.end, trading_index=trading_idx)
+
     regime_df = load_regime_data(args.start, args.end)
-    bt = run_backtest(data, regime_df, args.capital, fill_mode=args.fill_mode)
+    bt = run_backtest(data, regime_df, fx_rates, args.capital,
+                      base_currency=base_ccy, fill_mode=args.fill_mode)
     print_metrics(bt)
     save_trades_csv(bt)
     save_equity_csv(bt)
