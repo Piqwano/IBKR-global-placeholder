@@ -1802,6 +1802,21 @@ def _startup_self_test() -> bool:
         )
         checks_passed = False
 
+    # 10. DAILY_RESET_TZ parseable via ZoneInfo (external-review follow-up).
+    # _today_in_reset_tz() calls ZoneInfo(DAILY_RESET_TZ) every cycle; a typo
+    # would raise ZoneInfoNotFoundError mid-loop on the first day-roll, not
+    # at startup. Fail fast instead.
+    try:
+        _ = ZoneInfo(DAILY_RESET_TZ)
+        log.info(f"  ✅ DAILY_RESET_TZ={DAILY_RESET_TZ!r} parses via ZoneInfo")
+    except Exception as e:
+        log.critical(
+            f"  ❌ DAILY_RESET_TZ={DAILY_RESET_TZ!r} not a valid IANA tz "
+            f"({type(e).__name__}: {e}). Examples: America/New_York, "
+            f"Australia/Sydney, Europe/London."
+        )
+        checks_passed = False
+
     # 9. L-6: Discord webhook format check (soft). Malformed webhooks silently
     # 404 per-post and operators miss critical alerts.
     if DISCORD_WEBHOOK:
