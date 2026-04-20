@@ -61,6 +61,21 @@ from config import (
 
 log = logging.getLogger("ibkr-rsi")
 
+def _round_to_tick(price: float, exchange: str) -> float:
+    """
+    H-10: Round a limit price to the minimum tick size for the exchange.
+    IBKR rejects orders (Warning 110 → silent parent cancellation) when
+    the price doesn't conform to the venue's minimum price variation.
+    """
+    if exchange == "LSE":
+        # LSE prices in GBX: 0.5 GBX below 5000, 1.0 GBX above.
+        tick = 1.0 if price >= 5000 else 0.5
+    elif exchange in ("ASX", "SEHK", "SGX", "IBIS", "SBF", "AEB"):
+        tick = 0.01
+    else:
+        tick = 0.01
+    return round(round(price / tick) * tick, 4)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NUMERIC COERCION HELPERS  (L-8)
@@ -1171,7 +1186,7 @@ def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
         return False
     ib = get_ib()
     try:
-        tp_trade.order.lmtPrice = round(new_limit_price, 2)
+        tp_trade.order.lmtPrice = _round_to_tick(new_limit_price, tp_trade.contract.exchange)
         ib.placeOrder(tp_trade.contract, tp_trade.order)
         if not _verify_order_live(tp_trade, label="TP amend"):
             log.error(
@@ -1195,7 +1210,7 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
                                 purpose: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
     ib = get_ib()
     oca = _oca_group_name(contract.symbol, purpose)
-    tp_price = round(entry_ref_price * (1 + tp_pct), 2)
+    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract.exchange)
 
     tp = LimitOrder("SELL", qty, tp_price)
     tp.tif = "GTC"
@@ -1276,9 +1291,9 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
     trail_id = ib.client.getReqId()
     oca_group = _oca_group_name(contract.symbol, f"parent{parent_id}")
 
-    tp_price = round(entry_price_est * (1 + tp_pct), 2)
+    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract.exchange)
 
-    limit_price = round(entry_price_est * 1.01, 2)
+    limit_price = _round_to_tick(entry_price_est * 1.01, contract.exchange)
     parent = LimitOrder("BUY", qty, limit_price)
     parent.orderId = parent_id
     parent.transmit = False
