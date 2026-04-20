@@ -1291,7 +1291,7 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
     trail_id = ib.client.getReqId()
     oca_group = _oca_group_name(contract.symbol, f"parent{parent_id}")
 
-    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract.exchange)
+    tp_price = _round_to_tick(entry_price_est * (1 + tp_pct), contract.exchange)
 
     limit_price = _round_to_tick(entry_price_est * 1.01, contract.exchange)
     parent = LimitOrder("BUY", qty, limit_price)
