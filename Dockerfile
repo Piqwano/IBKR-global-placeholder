@@ -43,7 +43,6 @@ RUN mkdir -p /state && chown -R rsi:rsi /app /state
 RUN printf '#!/bin/sh\nset -e\nchown -R rsi:rsi /state 2>/dev/null || true\nexec su -s /bin/sh rsi -c "$*"\n' > /entrypoint.sh \
  && chmod +x /entrypoint.sh
 
-# Stay as root so entrypoint can chown /state, then drop to rsi.
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
