@@ -35,12 +35,15 @@ COPY global_rsi_bot.py /app/global_rsi_bot.py
 
 # State directory owned by the bot user (compose mounts /state).
 RUN mkdir -p /state && chown -R rsi:rsi /app /state
-USER rsi
 
-# FastAPI dashboard port. Override in compose/env as needed.
+# Small entrypoint script that fixes /state ownership (Railway volumes
+# mount as root) then drops privileges to the rsi user before exec'ing
+# the bot. This ensures the volume is writable regardless of how it
+# was provisioned.
+RUN printf '#!/bin/sh\nset -e\nchown -R rsi:rsi /state 2>/dev/null || true\nexec su -s /bin/sh rsi -c "$*"\n' > /entrypoint.sh \
+ && chmod +x /entrypoint.sh
+
 EXPOSE 8000
 
-# tini as PID 1 ensures SIGTERM from Railway/compose reaches Python,
-# which flips the _shutdown flag and triggers graceful save_state().
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "-u", "global_rsi_bot.py"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
+CMD ["python -u global_rsi_bot.py"]
