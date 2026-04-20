@@ -61,6 +61,25 @@ from config import (
 
 log = logging.getLogger("ibkr-rsi")
 
+def _round_to_tick(price: float, contract) -> float:
+    """
+    H-10: Round a limit price to the minimum tick size for the venue.
+    IBKR rejects orders (Warning 110 → silent parent cancellation) when
+    the price doesn't conform to the venue's minimum price variation.
+    When a contract is SMART-routed with a primaryExchange, use that
+    for tick-size rules (since SMART itself has no single tick size).
+    """
+    venue = getattr(contract, "primaryExchange", None) or getattr(contract, "exchange", "")
+
+    if venue == "LSE":
+        # LSE prices in GBX: 0.5 GBX below 5000, 1.0 GBX above.
+        tick = 1.0 if price >= 5000 else 0.5
+    elif venue in ("ASX", "SEHK", "SGX", "IBIS", "SBF", "AEB"):
+        tick = 0.01
+    else:
+        tick = 0.01
+    return round(round(price / tick) * tick, 4)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NUMERIC COERCION HELPERS  (L-8)
@@ -443,7 +462,13 @@ def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool,
 
 def make_stock(symbol: str, exchange: str, currency: str) -> Optional[Stock]:
     ib = get_ib()
-    contract = Stock(symbol, exchange, currency)
+    # Use SMART routing for non-US stocks to avoid IBKR Error 10311
+    # (direct-routing precautionary warning). The originally-specified
+    # exchange becomes the primaryExchange so IBKR routes correctly.
+    if exchange == "SMART":
+        contract = Stock(symbol, "SMART", currency)
+    else:
+        contract = Stock(symbol, "SMART", currency, primaryExchange=exchange)
     try:
         qualified = ib.qualifyContracts(contract)
     except Exception as e:
@@ -453,7 +478,6 @@ def make_stock(symbol: str, exchange: str, currency: str) -> Optional[Stock]:
         log.warning(f"Could not qualify {symbol} on {exchange}")
         return None
     return qualified[0]
-
 
 def get_contract(symbol: str, exchange: str, currency: str) -> Optional[Stock]:
     key = f"{symbol}:{exchange}:{currency}"
@@ -1165,7 +1189,7 @@ def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
         return False
     ib = get_ib()
     try:
-        tp_trade.order.lmtPrice = round(new_limit_price, 2)
+        tp_trade.order.lmtPrice = _round_to_tick(new_limit_price, tp_trade.contract)
         ib.placeOrder(tp_trade.contract, tp_trade.order)
         if not _verify_order_live(tp_trade, label="TP amend"):
             log.error(
@@ -1189,7 +1213,7 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
                                 purpose: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
     ib = get_ib()
     oca = _oca_group_name(contract.symbol, purpose)
-    tp_price = round(entry_ref_price * (1 + tp_pct), 2)
+    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract)
 
     tp = LimitOrder("SELL", qty, tp_price)
     tp.tif = "GTC"
@@ -1270,9 +1294,14 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
     trail_id = ib.client.getReqId()
     oca_group = _oca_group_name(contract.symbol, f"parent{parent_id}")
 
-    tp_price = round(entry_price_est * (1 + tp_pct), 2)
+    tp_price = _round_to_tick(entry_price_est * (1 + tp_pct), contract)
 
-    parent = MarketOrder("BUY", qty)
+    # H-9: Non-US venues (LSE, ASX, SEHK, etc.) reject trailing stops attached
+    # to Market parents (IBKR Error 328). Use a marketable limit — 1% above
+    # current price — which functionally fills like a market order but allows
+    # trail attachment across all exchanges.
+    limit_price = _round_to_tick(entry_price_est * 1.01, contract)
+    parent = LimitOrder("BUY", qty, limit_price)
     parent.orderId = parent_id
     parent.transmit = False
 
@@ -1436,7 +1465,8 @@ def buy_stock_simple(contract: Stock, amount: float) -> Optional[dict]:
     if qty is None:
         return None
     try:
-        order = MarketOrder("BUY", qty)
+        limit_price = _round_to_tick(price * 1.01, contract)
+        order = LimitOrder("BUY", qty, limit_price)
         trade = ib.placeOrder(contract, order)
         filled, filled_qty = _wait_for_fill(trade)
 
