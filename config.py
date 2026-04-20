@@ -10,6 +10,10 @@ v2.3 additions vs v2.2:
   - Exposure ceiling assertion constants surfaced for pre-loop check
 """
 
+# ⚠️⚠️⚠️ PAPER TEST BRANCH — DO NOT DEPLOY TO LIVE ⚠️⚠️⚠️
+# RSI_OVERSOLD, MAX_DRAWDOWN_PCT, and VIX_CACHE_TTL are modified for testing.
+# This branch is only for accelerated paper validation.
+
 import os
 from datetime import time
 
@@ -54,7 +58,7 @@ ORDER_PLACEMENT_VERIFY_SECS = 5.0
 # ══════════════════════════════════════════════════════════════════════════
 
 RSI_PERIOD = 14
-RSI_OVERSOLD = 40
+RSI_OVERSOLD = 50
 RSI_OVERBOUGHT = 60
 
 USE_VOLUME_FILTER = False
@@ -134,7 +138,7 @@ DAILY_LOSS_LIMIT_PCT = 0.02
 # down 50% overnight → ~13.5% NLV hit) that routine volatility could flatten
 # otherwise-healthy positions and realize panic-sell commission/slippage.
 # The hard floor is preserved; it's just deeper, giving brackets first chance.
-MAX_DRAWDOWN_PCT = 0.20
+MAX_DRAWDOWN_PCT = 0.05
 FLATTEN_ON_MAX_DD = True
 
 DAILY_RESET_TZ = os.getenv("DAILY_RESET_TZ", "America/New_York")
@@ -217,7 +221,7 @@ REGIME_CACHE_TTL = 1800              # SPY regime TTL (slow-moving)
 # v2.3 (M7): VIX needs its own tighter TTL. During fast-moving markets
 # VIX can shift 20%+ in 15 min; a 30-min cache can sustain a false BULL
 # regime well past the turn. 2 min is a reasonable balance against API rate.
-VIX_CACHE_TTL = 120
+VIX_CACHE_TTL = 30
 
 # C-1: FX rate cache. Major pairs move <0.5% intraday; 10 min is a sensible
 # balance between API calls and sizing precision. Revisit during high-vol
