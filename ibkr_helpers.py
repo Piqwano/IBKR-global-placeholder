@@ -61,16 +61,20 @@ from config import (
 
 log = logging.getLogger("ibkr-rsi")
 
-def _round_to_tick(price: float, exchange: str) -> float:
+def _round_to_tick(price: float, contract) -> float:
     """
-    H-10: Round a limit price to the minimum tick size for the exchange.
-    IBKR rejects orders (Warning 110 → silent parent cancellation) when
-    the price doesn't conform to the venue's minimum price variation.
+    H-10: Round a limit price to the minimum tick size for the venue.
+    When a contract is SMART-routed with a primaryExchange, use that
+    for tick-size rules (since SMART itself has no single tick size).
     """
-    if exchange == "LSE":
+    # Resolve the actual trading venue. SMART contracts carry primaryExchange;
+    # non-SMART contracts have exchange as the venue itself.
+    venue = getattr(contract, "primaryExchange", None) or getattr(contract, "exchange", "")
+
+    if venue == "LSE":
         # LSE prices in GBX: 0.5 GBX below 5000, 1.0 GBX above.
         tick = 1.0 if price >= 5000 else 0.5
-    elif exchange in ("ASX", "SEHK", "SGX", "IBIS", "SBF", "AEB"):
+    elif venue in ("ASX", "SEHK", "SGX", "IBIS", "SBF", "AEB"):
         tick = 0.01
     else:
         tick = 0.01
@@ -1186,7 +1190,7 @@ def _modify_tp_limit_price(tp_trade: Trade, new_limit_price: float) -> bool:
         return False
     ib = get_ib()
     try:
-        tp_trade.order.lmtPrice = _round_to_tick(new_limit_price, tp_trade.contract.exchange)
+        tp_trade.order.lmtPrice = _round_to_tick(new_limit_price, tp_trade.contract)
         ib.placeOrder(tp_trade.contract, tp_trade.order)
         if not _verify_order_live(tp_trade, label="TP amend"):
             log.error(
@@ -1210,8 +1214,7 @@ def _place_child_bracket_orders(contract: Stock, qty: int, entry_ref_price: floa
                                 purpose: str = "") -> Tuple[Optional[Trade], Optional[Trade]]:
     ib = get_ib()
     oca = _oca_group_name(contract.symbol, purpose)
-    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract.exchange)
-
+    tp_price = _round_to_tick(entry_ref_price * (1 + tp_pct), contract)
     tp = LimitOrder("SELL", qty, tp_price)
     tp.tif = "GTC"
     tp.ocaGroup = oca
@@ -1291,9 +1294,9 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
     trail_id = ib.client.getReqId()
     oca_group = _oca_group_name(contract.symbol, f"parent{parent_id}")
 
-    tp_price = _round_to_tick(entry_price_est * (1 + tp_pct), contract.exchange)
+    tp_price = _round_to_tick(entry_price_est * (1 + tp_pct), contract)
 
-    limit_price = _round_to_tick(entry_price_est * 1.01, contract.exchange)
+    limit_price = _round_to_tick(entry_price_est * 1.01, contract)
     parent = LimitOrder("BUY", qty, limit_price)
     parent.orderId = parent_id
     parent.transmit = False
