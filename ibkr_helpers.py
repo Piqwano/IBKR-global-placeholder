@@ -443,7 +443,13 @@ def is_market_open(exchange: str, now: Optional[datetime] = None) -> Tuple[bool,
 
 def make_stock(symbol: str, exchange: str, currency: str) -> Optional[Stock]:
     ib = get_ib()
-    contract = Stock(symbol, exchange, currency)
+    # Use SMART routing for non-US stocks to avoid IBKR Error 10311
+    # (direct-routing precautionary warning). The originally-specified
+    # exchange becomes the primaryExchange so IBKR routes correctly.
+    if exchange == "SMART":
+        contract = Stock(symbol, "SMART", currency)
+    else:
+        contract = Stock(symbol, "SMART", currency, primaryExchange=exchange)
     try:
         qualified = ib.qualifyContracts(contract)
     except Exception as e:
