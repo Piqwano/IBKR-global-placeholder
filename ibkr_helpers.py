@@ -161,7 +161,7 @@ def _resolve_account_value_raw(account_values, tag: str,
                 reason = (f"no BASE row for {tag} — fell back to "
                           f"{item.currency} {val}")
                 log.warning(f"⚠️  {reason}. Verify IBKR account config.")
-                return _ResolutionResult(val, False, reason)
+                return _ResolutionResult(val, True, reason)
             except (TypeError, ValueError):
                 continue
 
