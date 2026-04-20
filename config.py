@@ -215,7 +215,7 @@ MARKET_HOURS_GRACE_MINS_CLOSE = 5
 #  TIMING
 # ══════════════════════════════════════════════════════════════════════════
 
-SCAN_INTERVAL_SECS = 60 * 15
+SCAN_INTERVAL_SECS = 60
 BARS_FOR_RSI = 250
 REGIME_CACHE_TTL = 1800              # SPY regime TTL (slow-moving)
 # v2.3 (M7): VIX needs its own tighter TTL. During fast-moving markets
