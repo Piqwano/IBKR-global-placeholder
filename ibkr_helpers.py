@@ -1278,7 +1278,8 @@ def _place_bracket(contract: Stock, qty: int, entry_price_est: float,
 
     tp_price = round(entry_price_est * (1 + tp_pct), 2)
 
-    parent = MarketOrder("BUY", qty)
+    limit_price = round(entry_price_est * 1.01, 2)
+    parent = LimitOrder("BUY", qty, limit_price)
     parent.orderId = parent_id
     parent.transmit = False
 
@@ -1442,7 +1443,8 @@ def buy_stock_simple(contract: Stock, amount: float) -> Optional[dict]:
     if qty is None:
         return None
     try:
-        order = MarketOrder("BUY", qty)
+        limit_price = round(price * 1.01, 2)
+        order = LimitOrder("BUY", qty, limit_price)
         trade = ib.placeOrder(contract, order)
         filled, filled_qty = _wait_for_fill(trade)
 
