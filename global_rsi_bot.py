@@ -1170,7 +1170,16 @@ def _reconcile_post_sell(symbol: str, pos: dict,
                     f"for trade record."
                 )
                 fill_price = fill_info.get("price") or fill_price
-                filled_qty = confirmed_sold
+                # SAFETY (4.4): cap at orig_qty — if fills show more than we held,
+                # earlier-position fills leaked past the opened_after filter (e.g.
+                # corrupt opened_at). Never over-report exit qty in trade history.
+                if confirmed_sold > orig_qty:
+                    log.warning(
+                        f"  ⚠️  {symbol} fills show {confirmed_sold} > orig {orig_qty}; "
+                        f"capping to orig. Investigate opened_at correctness for this "
+                        f"position."
+                    )
+                filled_qty = min(confirmed_sold, orig_qty)
                 remaining_qty = 0
             else:
                 # Fills corroborate arithmetic — real partial, shares left somewhere.
