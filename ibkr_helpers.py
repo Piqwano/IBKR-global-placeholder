@@ -733,28 +733,17 @@ def get_vix_level() -> Optional[float]:
 _FX_STALE_WARN_LEVEL = 0.0  # last warn-price guard (unused; placeholder)
 
 
-def get_account_base_currency() -> str:
+def _try_detect_base_currency() -> Optional[str]:
+    """SAFETY (H-13): pure detection — no logging, no cache writes.
+    Returns the detected currency code or None if any step fails.
+    Caller decides what to do on None (env override, fail-closed, etc.).
     """
-    Resolve account base currency. IBKR's accountSummary returns each tag
-    with `currency="BASE"` plus a matching row with the real currency code.
-    We compare values across the two rows: whichever non-BASE currency has
-    the same value as BASE is the account's base currency.
-
-    Cached for the session. Falls back to "USD" if resolution fails.
-    """
-    cached = _manager.get_base_currency_cached()
-    if cached:
-        return cached
-
     ib = get_ib()
     try:
         vals = ib.accountSummary()
-    except Exception as e:
-        log.warning(f"get_account_base_currency: accountSummary failed ({e}) — defaulting USD")
-        _manager.set_base_currency("USD")
-        return "USD"
+    except Exception:
+        return None
 
-    # Gather NLV rows
     base_val: Optional[float] = None
     candidates: Dict[str, float] = {}
     for item in vals:
@@ -770,11 +759,8 @@ def get_account_base_currency() -> str:
             candidates[item.currency] = v
 
     if base_val is None or not candidates:
-        log.warning("get_account_base_currency: no BASE/currency pair in NLV — defaulting USD")
-        _manager.set_base_currency("USD")
-        return "USD"
+        return None
 
-    # Pick the currency whose value matches BASE (within rounding)
     best_ccy = None
     best_diff = float("inf")
     for ccy, v in candidates.items():
@@ -783,18 +769,75 @@ def get_account_base_currency() -> str:
             best_diff = diff
             best_ccy = ccy
 
-    # Accept if within 0.5% of BASE
     if best_ccy and base_val > 0 and best_diff / base_val < 0.005:
-        log.info(f"💱 Account base currency detected: {best_ccy}")
-        _manager.set_base_currency(best_ccy)
         return best_ccy
+    return None
 
-    log.warning(
-        f"get_account_base_currency: no row matched BASE NLV={base_val} "
-        f"(candidates={candidates}) — defaulting USD"
+
+def get_account_base_currency() -> str:
+    """
+    Resolve account base currency.
+
+    SAFETY (H-13): Prefer explicit ACCOUNT_BASE_CURRENCY env override over
+    heuristic detection. If detection and env disagree, warn loudly. If
+    both are absent, return sentinel "UNKNOWN" — convert_to_base /
+    convert_from_base treat that as "cannot size" and new buys are blocked.
+    """
+    from config import ACCOUNT_BASE_CURRENCY
+    cached = _manager.get_base_currency_cached()
+    if cached:
+        return cached
+
+    detected = _try_detect_base_currency()
+
+    if ACCOUNT_BASE_CURRENCY:
+        # SAFETY (H-13): env override wins, but warn loudly if IBKR
+        # disagrees — a misconfigured env var would silently mis-size
+        # every trade just as badly as the USD fallback it replaces.
+        if detected and detected != ACCOUNT_BASE_CURRENCY:
+            log.warning(
+                f"⚠️  ACCOUNT_BASE_CURRENCY={ACCOUNT_BASE_CURRENCY} "
+                f"overrides IBKR detected={detected}. Proceeding with "
+                f"env override. If detection was correct, all FX and "
+                f"sizing will be wrong. Verify IBKR account base."
+            )
+            try:
+                from global_rsi_bot import notify
+                notify(
+                    f"🚨 Base-currency mismatch: env={ACCOUNT_BASE_CURRENCY}, "
+                    f"IBKR detected={detected}. Using env override. Verify.",
+                    critical=True,
+                )
+            except Exception:
+                pass
+        log.info(f"💱 Using ACCOUNT_BASE_CURRENCY override: {ACCOUNT_BASE_CURRENCY}")
+        _manager.set_base_currency(ACCOUNT_BASE_CURRENCY)
+        return ACCOUNT_BASE_CURRENCY
+
+    if detected:
+        log.info(f"💱 Detected account base currency: {detected}")
+        _manager.set_base_currency(detected)
+        return detected
+
+    # SAFETY (H-13): Do not silently default to USD. Return a sentinel
+    # that convert_to_base/convert_from_base treat as "cannot size" —
+    # they return None and try_buy already aborts on None FX.
+    log.critical(
+        "get_account_base_currency: detection failed AND no "
+        "ACCOUNT_BASE_CURRENCY env override set. New buys BLOCKED "
+        "until resolved. Set ACCOUNT_BASE_CURRENCY=AUD (or your actual "
+        "base) and restart."
     )
-    _manager.set_base_currency("USD")
-    return "USD"
+    try:
+        from global_rsi_bot import notify
+        notify(
+            "🚨 Base-currency detection failed and no env override. "
+            "New buys blocked. Set ACCOUNT_BASE_CURRENCY and restart.",
+            critical=True,
+        )
+    except Exception:
+        pass
+    return "UNKNOWN"
 
 
 def _fetch_fx_rate_once(from_ccy: str, to_ccy: str) -> Optional[float]:
@@ -879,6 +922,8 @@ def get_fx_rate(from_ccy: str, to_ccy: str) -> Optional[float]:
 def convert_to_base(amount: float, from_ccy: str) -> Optional[float]:
     """Convert `amount` in from_ccy to the account base currency."""
     base = get_account_base_currency()
+    if base == "UNKNOWN":  # SAFETY (H-13): fail-closed when base unresolved
+        return None
     rate = get_fx_rate(from_ccy, base)
     if rate is None:
         return None
@@ -888,6 +933,8 @@ def convert_to_base(amount: float, from_ccy: str) -> Optional[float]:
 def convert_from_base(amount_base: float, to_ccy: str) -> Optional[float]:
     """Convert `amount_base` in account base currency to to_ccy."""
     base = get_account_base_currency()
+    if base == "UNKNOWN":  # SAFETY (H-13): fail-closed when base unresolved
+        return None
     rate = get_fx_rate(base, to_ccy)
     if rate is None:
         return None

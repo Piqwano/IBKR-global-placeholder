@@ -264,6 +264,14 @@ ADOPT_ORPHAN = os.getenv("ADOPT_ORPHAN", "").lower() in ("1", "true", "yes")
 # outcome-driven; this is operator-driven.
 HALT_NEW_BUYS = os.getenv("HALT_NEW_BUYS", "").lower() in ("1", "true", "yes")
 
+# SAFETY (H-13): Explicit account base currency override. When set,
+# takes precedence over IBKR accountSummary detection. Strongly
+# recommended for AUD/non-USD accounts where detection via BASE-row
+# heuristic can silently fall back to USD. If unset AND detection
+# fails, FX conversions return None and new buys are blocked — the
+# bot stays up for exits but refuses to size new positions.
+ACCOUNT_BASE_CURRENCY = os.getenv("ACCOUNT_BASE_CURRENCY", "").upper()
+
 # ══════════════════════════════════════════════════════════════════════════
 #  STARTUP SELF-TEST (v2.3)
 # ══════════════════════════════════════════════════════════════════════════
