@@ -13,7 +13,7 @@ FROM python:3.11.9-slim-bookworm
 # System deps kept minimal. No build tools — all wheels are pure or
 # prebuilt. tini for proper signal handling (SIGTERM forwarded).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini ca-certificates \
+ && apt-get install -y --no-install-recommends tini ca-certificates gosu \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user (defense in depth — if the bot is ever compromised,
@@ -36,14 +36,16 @@ COPY global_rsi_bot.py /app/global_rsi_bot.py
 # State directory owned by the bot user (compose mounts /state).
 RUN mkdir -p /state && chown -R rsi:rsi /app /state
 
-# Small entrypoint script that fixes /state ownership (Railway volumes
-# mount as root) then drops privileges to the rsi user before exec'ing
-# the bot. This ensures the volume is writable regardless of how it
-# was provisioned.
-RUN printf '#!/bin/sh\nset -e\nchown -R rsi:rsi /state 2>/dev/null || true\nexec su -s /bin/sh rsi -c "$*"\n' > /entrypoint.sh \
+# SAFETY (H-14): gosu execs directly into python without an intermediate
+# shell, preserving signal forwarding. Previous `su -s /bin/sh -c` chain
+# did not forward SIGTERM reliably, risking unclean save_state on
+# Railway redeploys.
+RUN printf '#!/bin/sh\nset -e\nchown -R rsi:rsi /state 2>/dev/null || true\nexec gosu rsi "$@"\n' > /entrypoint.sh \
  && chmod +x /entrypoint.sh
 
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
-CMD ["python -u global_rsi_bot.py"]
+# SAFETY (H-14): argv-form CMD avoids an intermediate `sh -c` wrapper
+# that would also break signal forwarding independent of gosu.
+CMD ["python", "-u", "global_rsi_bot.py"]
