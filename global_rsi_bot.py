@@ -75,6 +75,7 @@ from ibkr_helpers import (
     get_account_base_currency,
     convert_from_base, convert_to_base,
     sanitise_float,
+    _ACTIVE_ORDER_STATUSES,  # SAFETY (4.2): for cancel-verify before RSI-exit sell
 )
 from dashboard import start_dashboard, update_dashboard_state
 
@@ -1421,6 +1422,25 @@ def check_exits():
 
             try:
                 cancel_open_orders_for(contract)
+                # SAFETY (4.2): verify cancels propagate before placing the
+                # replacement market sell. Prevents double-sell race where TP
+                # fires while our market sell is already submitted.
+                ib = get_ib()
+                cancel_deadline = time.time() + 1.0
+                while time.time() < cancel_deadline:
+                    any_live = any(
+                        t.contract.conId == contract.conId
+                        and t.orderStatus.status in _ACTIVE_ORDER_STATUSES
+                        for t in ib.openTrades()
+                    )
+                    if not any_live:
+                        break
+                    ib.waitOnUpdate(timeout=0.2)
+                else:
+                    log.warning(
+                        f"  ⚠️  {symbol}: cancel did not verify cleared in 1s — "
+                        f"proceeding with sell anyway (could race)"
+                    )
             except Exception as e:
                 log.warning(f"Could not cancel OCA for {symbol}: {e}")
 
