@@ -61,6 +61,18 @@ from config import (
 
 log = logging.getLogger("ibkr-rsi")
 
+def _venue(contract) -> str:
+    """C-12: Resolve the actual venue for a contract. After the
+    make_stock SMART-routing change, contract.exchange is "SMART" for
+    non-US venues and the real venue lives in primaryExchange. US-native
+    SMART contracts may have primaryExchange unset, so fall back to
+    contract.exchange.
+    """
+    return (getattr(contract, "primaryExchange", None)
+            or getattr(contract, "exchange", "")
+            or "")
+
+
 def _round_to_tick(price: float, contract) -> float:
     """
     H-10: Round a limit price to the minimum tick size for the venue.
@@ -69,7 +81,7 @@ def _round_to_tick(price: float, contract) -> float:
     When a contract is SMART-routed with a primaryExchange, use that
     for tick-size rules (since SMART itself has no single tick size).
     """
-    venue = getattr(contract, "primaryExchange", None) or getattr(contract, "exchange", "")
+    venue = _venue(contract)  # SAFETY (C-12): same resolution as lot-size paths
 
     if venue == "LSE":
         # LSE prices in GBX: 0.5 GBX below 5000, 1.0 GBX above.
@@ -513,7 +525,7 @@ def get_daily_bars(contract, days: int = BARS_FOR_RSI) -> Optional[pd.DataFrame]
             return None
         return df
     except Exception as e:
-        log.warning(f"Bars error {contract.symbol}/{getattr(contract,'exchange','?')}: {e}")
+        log.warning(f"Bars error {contract.symbol}/{_venue(contract) or '?'}: {e}")  # SAFETY (C-12): real venue
         return None
 
 
@@ -1015,14 +1027,17 @@ _TERMINAL_DEAD_STATUSES = {"Cancelled", "ApiCancelled", "Inactive", "PendingCanc
 
 
 def _calc_quantity(contract: Stock, amount: float, price: float) -> Optional[int]:
-    if contract.exchange == "SGX":
+    # SAFETY (C-12): venue lives on primaryExchange now that make_stock
+    # routes non-US contracts via SMART. contract.exchange would be "SMART"
+    # and the SGX/SEHK branches would be silent dead code without this.
+    if _venue(contract) == "SGX":
         shares = int(amount / price)
         qty = (shares // 100) * 100
         if qty < 100:
             log.warning(f"Cannot afford 100-lot of {contract.symbol} @ ${price:.2f}")
             return None
         return qty
-    if contract.exchange == "SEHK":
+    if _venue(contract) == "SEHK":
         lot = SEHK_LOT_SIZES.get(contract.symbol, 100)
         shares = int(amount / price)
         qty = (shares // lot) * lot
@@ -1440,7 +1455,7 @@ def buy_stock_bracket(contract: Stock, amount: float,
     log.info(
         f"✅ BUY  {contract.symbol:<8} @ ${actual_price:.4f} qty:{actual_qty} "
         f"| TP:${round(actual_price*(1+tp_pct),2)} | Trail:{trail_pct*100:.1f}% "
-        f"| {contract.exchange} | Parent:{parent_trade.order.orderId}"
+        f"| {_venue(contract)} | Parent:{parent_trade.order.orderId}"  # SAFETY (C-12): show real venue, not "SMART"
     )
 
     return {
@@ -1522,7 +1537,8 @@ def sell_stock(contract: Stock, qty: float) -> Optional[dict]:
         avg_fill = sanitise_price(trade.orderStatus.avgFillPrice)
 
         avg_fill_display = f"${avg_fill:.4f}" if avg_fill is not None else "N/A"
-        log.info(f"🔴 SELL {contract.symbol:<8} qty:{filled_qty}/{qty} | {contract.exchange} | "
+        # SAFETY (C-12): _venue(contract) shows the real venue for SMART-routed non-US contracts.
+        log.info(f"🔴 SELL {contract.symbol:<8} qty:{filled_qty}/{qty} | {_venue(contract)} | "
                  f"Order:{trade.order.orderId} @ {avg_fill_display}")
         return {
             "order_id": str(trade.order.orderId),
