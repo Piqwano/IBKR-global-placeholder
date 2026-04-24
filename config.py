@@ -65,13 +65,22 @@ USE_MA20_FILTER = False
 #  EXITS
 # ══════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TRAILING_STOP = 0.06
+# Widened from 0.06 → 0.10 after the 2022-2024 US-only parameter sweep
+# (backtest.py --sweep quick, ranked by Sharpe). The old 6% trail was
+# firing on ~67% of trades at an average -3.5% loss because mean-reversion
+# entries into oversold stocks face elevated intraday volatility that
+# routinely punches through a tight trail before the bounce plays out.
+# 10% paired with ATR-based stops (below) gave the best risk-adjusted
+# return in the sweep.
+DEFAULT_TRAILING_STOP = 0.10
 DEFAULT_TAKE_PROFIT = 0.08
 
-USE_ATR_STOPS = False
+# Enabled by the same sweep — volatility-adaptive stops. For each trade
+# the effective stop is max(DEFAULT_TRAILING_STOP, ATR_MULTIPLIER × ATR / price).
+# Low-vol names keep the 10% floor; high-vol names get a wider, ATR-sized
+# stop so they aren't whipsawed out prematurely.
+USE_ATR_STOPS = True
 ATR_PERIOD = 14
-# L-5: no-op unless USE_ATR_STOPS=True. Kept here so the parameter is in
-# one place if/when ATR stops are re-enabled.
 ATR_MULTIPLIER = 1.5
 
 USE_BRACKET_ORDERS = True
