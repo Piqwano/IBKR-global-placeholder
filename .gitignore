@@ -40,3 +40,5 @@ logs/
 # Backtest outputs
 backtest_trades.csv
 backtest_equity.csv
+backtest_sweep.csv
+.backtest_cache/

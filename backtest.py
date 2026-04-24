@@ -41,13 +41,23 @@ Run:
     python backtest.py --start 2020-01-01 --end 2024-12-31
     python backtest.py --capital 10000 --symbols AAPL MSFT NVDA
     python backtest.py --base-currency USD              # or AUD
+
+Parameter sweep — grid-search exit/entry parameters to find the best combo:
+    python backtest.py --start 2022-01-01 --sweep quick
+    python backtest.py --start 2022-01-01 --sweep full --sweep-rank sharpe
+    python backtest.py --start 2022-01-01 --sweep full --sweep-top 30
+
+The first sweep run downloads and caches yfinance data under
+.backtest_cache/; subsequent sweeps reuse the cache (much faster).
 """
 
 import argparse
 import math
+import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from itertools import product
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -109,7 +119,8 @@ def yf_fx_ticker(from_ccy: str, to_ccy: str) -> str:
 
 def load_fx_data(base_ccy: str, currencies: List[str],
                  start: str, end: str,
-                 trading_index: Optional[pd.DatetimeIndex] = None
+                 trading_index: Optional[pd.DatetimeIndex] = None,
+                 cache_dir: Optional[str] = None,
                  ) -> Dict[str, pd.Series]:
     """
     Return {ccy: Series[date → rate(ccy→base_ccy)]}.
@@ -132,7 +143,7 @@ def load_fx_data(base_ccy: str, currencies: List[str],
     for ccy in needed:
         tkr = yf_fx_ticker(ccy, base_ccy)
         try:
-            fx = yf.download(tkr, start=start, end=end, progress=False, auto_adjust=True)
+            fx = _yf_download_cached(tkr, start, end, cache_dir, kind="fx")
             if fx.empty:
                 raise ValueError("empty FX dataframe")
             if isinstance(fx.columns, pd.MultiIndex):
@@ -243,13 +254,56 @@ def atr_series(high: pd.Series, low: pd.Series, close: pd.Series,
 #  DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════
 
-def load_data(symbols: List[Tuple[str, str, str, str]], start: str, end: str) -> Dict[str, pd.DataFrame]:
+CACHE_DIR_DEFAULT = ".backtest_cache"
+
+
+def _cache_path(cache_dir: str, kind: str, key: str,
+                start: str, end: str) -> str:
+    safe = key.replace("/", "_").replace("=", "_")
+    return os.path.join(cache_dir, f"{start}_{end}", kind, f"{safe}.parquet")
+
+
+def _yf_download_cached(tkr: str, start: str, end: str,
+                        cache_dir: Optional[str],
+                        kind: str = "equity") -> pd.DataFrame:
+    """yf.download with on-disk parquet cache, keyed on (start, end, tkr).
+
+    Dramatically speeds up repeat backtests and the sweep mode (where we run
+    the same universe hundreds of times with different params). yfinance is
+    the slowest step; the cache makes subsequent runs ~instant.
+    """
+    if cache_dir:
+        path = _cache_path(cache_dir, kind, tkr, start, end)
+        if os.path.exists(path):
+            try:
+                return pd.read_parquet(path)
+            except Exception:
+                pass  # Corrupt cache file → re-download
+
+    df = yf.download(tkr, start=start, end=end, progress=False,
+                     auto_adjust=True)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if cache_dir:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            df.to_parquet(path)
+        except Exception as e:
+            print(f"   ⚠️  cache write failed for {tkr}: {e}")
+    return df
+
+
+def load_data(symbols: List[Tuple[str, str, str, str]],
+              start: str, end: str,
+              cache_dir: Optional[str] = None) -> Dict[str, pd.DataFrame]:
     data = {}
-    print(f"📥 Downloading {len(symbols)} symbols from yfinance...")
+    src = "cache+yfinance" if cache_dir else "yfinance"
+    print(f"📥 Loading {len(symbols)} symbols from {src}...")
     for symbol, exchange, currency, name in symbols:
         yt = yf_ticker(symbol, exchange)
         try:
-            df = yf.download(yt, start=start, end=end, progress=False, auto_adjust=True)
+            df = _yf_download_cached(yt, start, end, cache_dir, kind="equity")
             if df.empty or len(df) < RSI_PERIOD + 30:
                 print(f"   ⚠️  {symbol} ({yt}): insufficient data, skipping")
                 continue
@@ -288,8 +342,9 @@ def load_data(symbols: List[Tuple[str, str, str, str]], start: str, end: str) ->
     return data
 
 
-def load_regime_data(start: str, end: str) -> pd.DataFrame:
-    spy = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=True)
+def load_regime_data(start: str, end: str,
+                     cache_dir: Optional[str] = None) -> pd.DataFrame:
+    spy = _yf_download_cached("SPY", start, end, cache_dir, kind="regime")
     if isinstance(spy.columns, pd.MultiIndex):
         spy.columns = spy.columns.get_level_values(0)
     spy.columns = [c.lower() for c in spy.columns]
@@ -310,6 +365,33 @@ def load_regime_data(start: str, end: str) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════
 #  BACKTEST STATE
 # ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class StrategyParams:
+    """All entry/exit knobs the sweep varies. Defaults mirror config.py so
+    a backtest without --sweep produces the same result as before."""
+    rsi_oversold: int = RSI_OVERSOLD
+    rsi_overbought: int = RSI_OVERBOUGHT
+    default_trailing_stop: float = DEFAULT_TRAILING_STOP
+    default_take_profit: float = DEFAULT_TAKE_PROFIT
+    use_atr_stops: bool = USE_ATR_STOPS
+    atr_multiplier: float = ATR_MULTIPLIER
+    use_volume_filter: bool = USE_VOLUME_FILTER
+    use_trend_filter: bool = USE_TREND_FILTER
+    use_ma20_filter: bool = USE_MA20_FILTER
+
+    def label(self) -> str:
+        """Short stable tag used in sweep output — easy to grep / sort."""
+        return (
+            f"rsi{self.rsi_oversold}"
+            f"/tr{int(round(self.default_trailing_stop*100))}"
+            f"/tp{int(round(self.default_take_profit*100))}"
+            f"/atr{'T' if self.use_atr_stops else 'F'}"
+            f"/trend{'T' if self.use_trend_filter else 'F'}"
+            f"/vol{'T' if self.use_volume_filter else 'F'}"
+            f"/ma20{'T' if self.use_ma20_filter else 'F'}"
+        )
+
 
 @dataclass
 class Position:
@@ -560,7 +642,10 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                  fx_rates: Dict[str, pd.Series],
                  starting_capital: float,
                  base_currency: str = "USD",
-                 fill_mode: str = BACKTEST_FILL_MODE) -> Backtester:
+                 fill_mode: str = BACKTEST_FILL_MODE,
+                 params: Optional[StrategyParams] = None) -> Backtester:
+    if params is None:
+        params = StrategyParams()
 
     bt = Backtester(
         starting_capital=starting_capital,
@@ -706,16 +791,16 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
             price = float(row["close"])
             if math.isnan(rsi) or math.isnan(price):
                 continue
-            if rsi > RSI_OVERSOLD:
+            if rsi > params.rsi_oversold:
                 continue
 
-            if USE_VOLUME_FILTER and float(row["volume"]) <= float(row["vol_avg20"]):
+            if params.use_volume_filter and float(row["volume"]) <= float(row["vol_avg20"]):
                 _bump(bt.rejection_counts, "volume_filter")
                 continue
-            if USE_TREND_FILTER and price <= float(row["ma200"]):
+            if params.use_trend_filter and price <= float(row["ma200"]):
                 _bump(bt.rejection_counts, "trend200_filter")
                 continue
-            if USE_MA20_FILTER and price <= float(row["ma20"]):
+            if params.use_ma20_filter and price <= float(row["ma20"]):
                 _bump(bt.rejection_counts, "ma20_filter")
                 continue
 
@@ -752,12 +837,12 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 continue
 
             cfg = ASSET_CONFIG.get(sym, {}).copy()
-            cfg.setdefault("trailing_stop", DEFAULT_TRAILING_STOP)
-            cfg.setdefault("take_profit", DEFAULT_TAKE_PROFIT)
-            cfg.setdefault("rsi_exit", RSI_OVERBOUGHT)
+            cfg.setdefault("trailing_stop", params.default_trailing_stop)
+            cfg.setdefault("take_profit", params.default_take_profit)
+            cfg.setdefault("rsi_exit", params.rsi_overbought)
 
-            if USE_ATR_STOPS and not math.isnan(float(row["atr"])):
-                atr_pct = (ATR_MULTIPLIER * float(row["atr"])) / price
+            if params.use_atr_stops and not math.isnan(float(row["atr"])):
+                atr_pct = (params.atr_multiplier * float(row["atr"])) / price
                 cfg["trailing_stop"] = max(cfg["trailing_stop"], atr_pct)
 
             exchange = df["exchange"].iloc[0]
@@ -790,59 +875,86 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
 #  METRICS
 # ══════════════════════════════════════════════════════════════════════════
 
-def print_metrics(bt: Backtester):
+def compute_metrics(bt: Backtester) -> dict:
+    """Extract the same numbers print_metrics displays, as a dict. Shared
+    between the single-run pretty-print and the sweep ranking table."""
     if not bt.equity_curve:
-        print("No data.")
-        return
+        return {}
 
     dates = [d for d, _ in bt.equity_curve]
     equity = np.array([e for _, e in bt.equity_curve])
     returns = np.diff(equity) / equity[:-1]
 
-    final = equity[-1]
+    final = float(equity[-1])
     total_return = (final / bt.starting_capital - 1) * 100
     days = (dates[-1] - dates[0]).days
     years = days / 365.25 if days > 0 else 1
     cagr = ((final / bt.starting_capital) ** (1 / years) - 1) * 100 if years > 0 else 0
 
-    sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(252)) if len(returns) > 1 and np.std(returns) > 0 else 0
+    sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(252)) if len(returns) > 1 and np.std(returns) > 0 else 0.0
 
     peak = np.maximum.accumulate(equity)
     drawdowns = (equity - peak) / peak
-    max_dd = drawdowns.min() * 100
+    max_dd = float(drawdowns.min() * 100) if len(drawdowns) else 0.0
+    calmar = (cagr / abs(max_dd)) if max_dd < 0 else float("nan")
 
     wins = [t for t in bt.trades if t.pnl > 0]
     losses = [t for t in bt.trades if t.pnl <= 0]
     win_rate = len(wins) / len(bt.trades) * 100 if bt.trades else 0
-    avg_win = np.mean([t.pnl_pct for t in wins]) if wins else 0
-    avg_loss = np.mean([t.pnl_pct for t in losses]) if losses else 0
-    profit_factor = (sum(t.pnl for t in wins) / abs(sum(t.pnl for t in losses))) if losses and sum(t.pnl for t in losses) != 0 else float('inf')
+    avg_win = float(np.mean([t.pnl_pct for t in wins])) if wins else 0.0
+    avg_loss = float(np.mean([t.pnl_pct for t in losses])) if losses else 0.0
+    loss_total = sum(t.pnl for t in losses)
+    profit_factor = (sum(t.pnl for t in wins) / abs(loss_total)) if losses and loss_total != 0 else float("inf")
 
-    total_comm = sum(t.commission for t in bt.trades)
-    total_slip = sum(t.slippage for t in bt.trades)
+    return {
+        "final": final,
+        "total_return": total_return,
+        "cagr": cagr,
+        "sharpe": float(sharpe),
+        "max_dd": max_dd,
+        "calmar": calmar,
+        "trades": len(bt.trades),
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_factor": profit_factor,
+        "total_commission": sum(t.commission for t in bt.trades),
+        "total_slippage": sum(t.slippage for t in bt.trades),
+        "years": years,
+        "start": dates[0].date(),
+        "end": dates[-1].date(),
+    }
+
+
+def print_metrics(bt: Backtester):
+    m = compute_metrics(bt)
+    if not m:
+        print("No data.")
+        return
 
     base = bt.base_currency
     print("\n" + "═" * 72)
     print("  📊 BACKTEST RESULTS")
     print("═" * 72)
-    print(f"  Period          : {dates[0].date()} → {dates[-1].date()} ({years:.2f} yrs)")
+    print(f"  Period          : {m['start']} → {m['end']} ({m['years']:.2f} yrs)")
     print(f"  Fill mode       : {bt.fill_mode}")
     print(f"  Base currency   : {base} (all P&L / equity / cash denominated here)")
     print(f"  Starting capital: {base} {bt.starting_capital:,.2f}")
-    print(f"  Ending capital  : {base} {final:,.2f}")
-    print(f"  Total return    : {total_return:+.2f}%")
-    print(f"  CAGR            : {cagr:+.2f}%")
-    print(f"  Sharpe (ann.)   : {sharpe:.2f}")
-    print(f"  Max drawdown    : {max_dd:.2f}%")
+    print(f"  Ending capital  : {base} {m['final']:,.2f}")
+    print(f"  Total return    : {m['total_return']:+.2f}%")
+    print(f"  CAGR            : {m['cagr']:+.2f}%")
+    print(f"  Sharpe (ann.)   : {m['sharpe']:.2f}")
+    print(f"  Max drawdown    : {m['max_dd']:.2f}%")
+    print(f"  Calmar          : {m['calmar']:.2f}")
     print()
-    print(f"  Trades          : {len(bt.trades)}")
-    print(f"  Win rate        : {win_rate:.1f}%")
-    print(f"  Avg win         : {avg_win:+.2f}%  (native-price return, FX-independent)")
-    print(f"  Avg loss        : {avg_loss:+.2f}%  (native-price return, FX-independent)")
-    print(f"  Profit factor   : {profit_factor:.2f}")
+    print(f"  Trades          : {m['trades']}")
+    print(f"  Win rate        : {m['win_rate']:.1f}%")
+    print(f"  Avg win         : {m['avg_win']:+.2f}%  (native-price return, FX-independent)")
+    print(f"  Avg loss        : {m['avg_loss']:+.2f}%  (native-price return, FX-independent)")
+    print(f"  Profit factor   : {m['profit_factor']:.2f}")
     print()
-    print(f"  Total commission: {base} {total_comm:,.2f}  (entry + exit)")
-    print(f"  Total slippage  : {base} {total_slip:,.2f}  (entry + exit)")
+    print(f"  Total commission: {base} {m['total_commission']:,.2f}  (entry + exit)")
+    print(f"  Total slippage  : {base} {m['total_slippage']:,.2f}  (entry + exit)")
     print("═" * 72)
 
     print("\n  Exit reason breakdown:")
@@ -892,6 +1004,204 @@ def save_equity_csv(bt: Backtester, path: str = "backtest_equity.csv"):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  PARAMETER SWEEP
+# ══════════════════════════════════════════════════════════════════════════
+
+# Quick preset — 18 combos targeting the parameters we know are broken based
+# on the US-only baseline (too many trailing_stops firing at -3.5%).
+# Focused on loosening the exit and adding the trend filter.
+SWEEP_QUICK = [
+    {"rsi_oversold": [30, 35, 40]},
+    {"default_trailing_stop": [0.06, 0.08, 0.10]},
+    {"use_atr_stops": [False, True]},
+    {"use_trend_filter": [False, True]},
+]
+
+# Full preset — broader grid for a more exhaustive search.
+SWEEP_FULL = [
+    {"rsi_oversold": [30, 35, 40]},
+    {"default_trailing_stop": [0.06, 0.08, 0.10, 0.12]},
+    {"default_take_profit": [0.08, 0.10, 0.12]},
+    {"use_atr_stops": [False, True]},
+    {"atr_multiplier": [1.5, 2.5]},
+    {"use_trend_filter": [False, True]},
+    {"use_volume_filter": [False, True]},
+]
+
+
+def build_param_grid(preset: str) -> List[StrategyParams]:
+    """Build a list of StrategyParams from a preset descriptor. Each dict in
+    the preset list contributes one axis of the Cartesian product."""
+    if preset == "quick":
+        spec = SWEEP_QUICK
+    elif preset == "full":
+        spec = SWEEP_FULL
+    else:
+        raise ValueError(f"Unknown sweep preset: {preset}")
+
+    # Pull out axis name + values. We drop axes where only one value is
+    # offered so the Cartesian product size stays minimal.
+    axes = []
+    for item in spec:
+        (name, values), = item.items()
+        axes.append((name, values))
+
+    # Cartesian product — atr_multiplier only matters when use_atr_stops=True,
+    # so we deduplicate redundant atr_multiplier variants post-hoc.
+    base = StrategyParams()
+    seen = set()
+    grid: List[StrategyParams] = []
+    for combo in product(*(values for _, values in axes)):
+        overrides = {name: val for (name, _), val in zip(axes, combo)}
+        params = replace(base, **overrides)
+        # If ATR stops disabled, atr_multiplier has no effect → dedupe.
+        key_fields = {
+            "rsi_oversold": params.rsi_oversold,
+            "rsi_overbought": params.rsi_overbought,
+            "default_trailing_stop": params.default_trailing_stop,
+            "default_take_profit": params.default_take_profit,
+            "use_atr_stops": params.use_atr_stops,
+            "atr_multiplier": params.atr_multiplier if params.use_atr_stops else None,
+            "use_volume_filter": params.use_volume_filter,
+            "use_trend_filter": params.use_trend_filter,
+            "use_ma20_filter": params.use_ma20_filter,
+        }
+        key = tuple(sorted(key_fields.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        grid.append(params)
+    return grid
+
+
+# Which metrics a ranking mode cares about (higher is always better here).
+RANK_MODES = {
+    "sharpe":        lambda m: m["sharpe"],
+    "cagr":          lambda m: m["cagr"],
+    "calmar":        lambda m: m["calmar"] if math.isfinite(m["calmar"]) else -1e9,
+    "profit_factor": lambda m: m["profit_factor"] if math.isfinite(m["profit_factor"]) else 1e9,
+    "total_return":  lambda m: m["total_return"],
+}
+
+
+def run_sweep(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
+              fx_rates: Dict[str, pd.Series],
+              starting_capital: float, base_currency: str,
+              fill_mode: str, grid: List[StrategyParams]) -> List[dict]:
+    """Run the backtest once per StrategyParams in `grid`. Data is reused
+    across runs, so wall time is bounded by the backtest loop * |grid|."""
+    results: List[dict] = []
+    n = len(grid)
+    print(f"\n🔬 Parameter sweep: {n} combinations")
+    width = len(str(n))
+    for i, params in enumerate(grid, 1):
+        bt = run_backtest(data, regime_df, fx_rates, starting_capital,
+                          base_currency=base_currency, fill_mode=fill_mode,
+                          params=params)
+        metrics = compute_metrics(bt)
+        metrics["params"] = params
+        metrics["label"] = params.label()
+        # Also capture exit-reason share — the biggest diagnostic signal.
+        exit_counts: Dict[str, int] = {}
+        for t in bt.trades:
+            exit_counts[t.reason] = exit_counts.get(t.reason, 0) + 1
+        metrics["exit_counts"] = exit_counts
+        results.append(metrics)
+        print(
+            f"  [{i:>{width}}/{n}] {params.label():<55} "
+            f"ret {metrics['total_return']:+6.1f}% "
+            f"sharpe {metrics['sharpe']:+5.2f} "
+            f"DD {metrics['max_dd']:+5.1f}% "
+            f"pf {metrics['profit_factor']:4.2f} "
+            f"trades {metrics['trades']:>4}"
+        )
+    return results
+
+
+def print_sweep_leaderboard(results: List[dict], rank: str, top: int,
+                            base_currency: str) -> None:
+    if not results:
+        print("  No sweep results to rank.")
+        return
+    if rank not in RANK_MODES:
+        raise ValueError(f"Unknown rank mode: {rank}")
+    keyfn = RANK_MODES[rank]
+    ordered = sorted(results, key=keyfn, reverse=True)
+
+    print("\n" + "═" * 120)
+    print(f"  🏆 SWEEP LEADERBOARD — ranked by {rank} (top {min(top, len(ordered))})")
+    print("═" * 120)
+    header = (
+        f"  {'#':>3}  {'config':<55}  "
+        f"{'ret':>8}  {'cagr':>7}  {'sharpe':>7}  "
+        f"{'maxDD':>7}  {'calmar':>7}  {'pf':>5}  "
+        f"{'wr':>5}  {'trades':>6}"
+    )
+    print(header)
+    print("-" * 120)
+    for rank_pos, m in enumerate(ordered[:top], 1):
+        pf = m["profit_factor"]
+        pf_str = f"{pf:5.2f}" if math.isfinite(pf) else "  inf"
+        calmar = m["calmar"]
+        calmar_str = f"{calmar:+7.2f}" if math.isfinite(calmar) else "    n/a"
+        print(
+            f"  {rank_pos:>3}  {m['label']:<55}  "
+            f"{m['total_return']:+7.1f}%  "
+            f"{m['cagr']:+6.1f}%  "
+            f"{m['sharpe']:+7.2f}  "
+            f"{m['max_dd']:+6.1f}%  "
+            f"{calmar_str}  "
+            f"{pf_str}  "
+            f"{m['win_rate']:4.1f}%  "
+            f"{m['trades']:>6}"
+        )
+    print("═" * 120)
+
+    # Also dump the full result set to CSV for offline analysis.
+    rows = []
+    for m in ordered:
+        p: StrategyParams = m["params"]
+        rows.append({
+            "label": m["label"],
+            "rsi_oversold": p.rsi_oversold,
+            "default_trailing_stop": p.default_trailing_stop,
+            "default_take_profit": p.default_take_profit,
+            "use_atr_stops": p.use_atr_stops,
+            "atr_multiplier": p.atr_multiplier,
+            "use_trend_filter": p.use_trend_filter,
+            "use_volume_filter": p.use_volume_filter,
+            "use_ma20_filter": p.use_ma20_filter,
+            "total_return_pct": m["total_return"],
+            "cagr_pct": m["cagr"],
+            "sharpe": m["sharpe"],
+            "max_dd_pct": m["max_dd"],
+            "calmar": m["calmar"],
+            "profit_factor": m["profit_factor"],
+            "win_rate_pct": m["win_rate"],
+            "trades": m["trades"],
+            "avg_win_pct": m["avg_win"],
+            "avg_loss_pct": m["avg_loss"],
+        })
+    out = "backtest_sweep.csv"
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"\n  💾 Full sweep results → {out}")
+    winner = ordered[0]
+    winner_params: StrategyParams = winner["params"]
+    print(f"\n  🥇 Winner config: {winner['label']}")
+    print(
+        f"     To use these settings in the live bot, edit config.py:\n"
+        f"       RSI_OVERSOLD = {winner_params.rsi_oversold}\n"
+        f"       DEFAULT_TRAILING_STOP = {winner_params.default_trailing_stop}\n"
+        f"       DEFAULT_TAKE_PROFIT = {winner_params.default_take_profit}\n"
+        f"       USE_ATR_STOPS = {winner_params.use_atr_stops}\n"
+        f"       ATR_MULTIPLIER = {winner_params.atr_multiplier}\n"
+        f"       USE_TREND_FILTER = {winner_params.use_trend_filter}\n"
+        f"       USE_VOLUME_FILTER = {winner_params.use_volume_filter}\n"
+        f"       USE_MA20_FILTER = {winner_params.use_ma20_filter}\n"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -907,7 +1217,23 @@ def main():
     parser.add_argument("--base-currency", default="USD",
                         help="Base currency for cash/equity/P&L (e.g. USD, AUD). "
                              "Non-base currencies pull FX from yfinance.")
+    parser.add_argument("--cache-dir", default=CACHE_DIR_DEFAULT,
+                        help="On-disk cache for yfinance data. Pass empty "
+                             "string to disable caching.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable yfinance disk cache (equivalent to --cache-dir='').")
+    parser.add_argument("--sweep", choices=["quick", "full"], default=None,
+                        help="Run a parameter sweep instead of a single backtest. "
+                             "'quick' ≈ 36 combos, 'full' ≈ 576 combos.")
+    parser.add_argument("--sweep-rank",
+                        choices=list(RANK_MODES.keys()), default="sharpe",
+                        help="Metric to rank sweep results by (default: sharpe).")
+    parser.add_argument("--sweep-top", type=int, default=20,
+                        help="How many top-ranked configurations to show "
+                             "(default: 20).")
     args = parser.parse_args()
+
+    cache_dir = None if args.no_cache or not args.cache_dir else args.cache_dir
 
     universe = STOCK_UNIVERSE
     if args.us_only:
@@ -921,11 +1247,15 @@ def main():
     print(f"   Universe : {len(universe)} symbols")
     print(f"   Fill mode: {args.fill_mode}")
     print(f"   Base ccy : {base_ccy}")
-    print(f"   Filters  : Vol={USE_VOLUME_FILTER} Trend200={USE_TREND_FILTER} MA20={USE_MA20_FILTER}")
-    print(f"   ATR stops: {USE_ATR_STOPS} (mult={ATR_MULTIPLIER})")
+    print(f"   Cache    : {cache_dir or 'disabled'}")
+    if args.sweep:
+        print(f"   Mode     : SWEEP ({args.sweep}) — ranking by {args.sweep_rank}")
+    else:
+        print(f"   Filters  : Vol={USE_VOLUME_FILTER} Trend200={USE_TREND_FILTER} MA20={USE_MA20_FILTER}")
+        print(f"   ATR stops: {USE_ATR_STOPS} (mult={ATR_MULTIPLIER})")
     print()
 
-    data = load_data(universe, args.start, args.end)
+    data = load_data(universe, args.start, args.end, cache_dir=cache_dir)
     if not data:
         print("No data loaded.")
         sys.exit(1)
@@ -939,9 +1269,21 @@ def main():
     print(f"   Currencies in universe: {currencies_in_universe}")
     print(f"📥 Loading FX rates → {base_ccy}...")
     fx_rates = load_fx_data(base_ccy, currencies_in_universe,
-                             args.start, args.end, trading_index=trading_idx)
+                             args.start, args.end,
+                             trading_index=trading_idx,
+                             cache_dir=cache_dir)
 
-    regime_df = load_regime_data(args.start, args.end)
+    regime_df = load_regime_data(args.start, args.end, cache_dir=cache_dir)
+
+    if args.sweep:
+        grid = build_param_grid(args.sweep)
+        results = run_sweep(
+            data, regime_df, fx_rates, args.capital,
+            base_currency=base_ccy, fill_mode=args.fill_mode, grid=grid,
+        )
+        print_sweep_leaderboard(results, args.sweep_rank, args.sweep_top, base_ccy)
+        return
+
     bt = run_backtest(data, regime_df, fx_rates, args.capital,
                       base_currency=base_ccy, fill_mode=args.fill_mode)
     print_metrics(bt)
