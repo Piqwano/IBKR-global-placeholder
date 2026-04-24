@@ -171,6 +171,19 @@ def _resolve_account_value_raw(account_values, tag: str,
     C1: Pure function. Returns (value, healthy, reason).
     Does NOT touch the module health flag — that's the cycle-level caller's
     job so one degraded tag can poison the whole cycle atomically.
+
+    Resolution precedence:
+      1. IBKR-emitted BASE row        → authoritative, healthy.
+      2. Row matching explicit env    → double-confirmed (user declared +
+         ACCOUNT_BASE_CURRENCY          IBKR agrees), healthy.
+      3. Any other allowed currency   → ambiguous fallback, unhealthy.
+
+    Rationale for (2): small single-currency accounts (typical AUD retail
+    at IBKR) often have NO multi-currency activity, so IBKR never emits
+    a BASE row — only the native-currency row. Before this path existed,
+    those accounts failed the startup self-test despite being perfectly
+    well-configured. Requiring an explicit ACCOUNT_BASE_CURRENCY env
+    override prevents a silent mismatch (e.g. USD-account vs AUD row).
     """
     # Pass 1 — BASE is authoritative
     for item in account_values:
@@ -184,7 +197,29 @@ def _resolve_account_value_raw(account_values, tag: str,
                     f"malformed BASE value for {tag}: {item.value!r}"
                 )
 
-    # Pass 2 — no BASE, fall back
+    # Pass 1b — no BASE row, but an explicit ACCOUNT_BASE_CURRENCY
+    # override is set AND IBKR returned a row in that exact currency.
+    # Treat as healthy: user-declared base + IBKR agreement is stronger
+    # evidence than a lone BASE row. See docstring rationale above.
+    from config import ACCOUNT_BASE_CURRENCY
+    if ACCOUNT_BASE_CURRENCY:
+        for item in account_values:
+            if item.tag == tag and item.currency == ACCOUNT_BASE_CURRENCY:
+                try:
+                    val = float(item.value)
+                    return _ResolutionResult(
+                        val, True,
+                        f"{tag} resolved via ACCOUNT_BASE_CURRENCY override "
+                        f"({ACCOUNT_BASE_CURRENCY} {val}) — no BASE row, "
+                        f"but IBKR returned matching currency"
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+    # Pass 2 — no BASE, no override match: fall back to any allowed ccy
+    # and flag the account as unhealthy for manual verification. This is
+    # the correct behaviour when IBKR returns e.g. AUD but the user
+    # declared ACCOUNT_BASE_CURRENCY=USD — a real silent-mismatch risk.
     for item in account_values:
         if item.tag == tag and item.currency in allowed_currencies:
             try:
