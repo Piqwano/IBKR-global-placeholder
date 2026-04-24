@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+import zlib
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -68,8 +69,14 @@ def _synth_ohlc(start: str, end: str, start_price: float, drift: float,
 
 
 # Per-ticker deterministic params so repeat runs produce the same data.
+#
+# Python 3's builtin `hash(str)` uses SipHash with a per-process random salt
+# (PEP 456) unless PYTHONHASHSEED is pinned — so `hash("AAPL")` differs
+# every invocation, which breaks the determinism contract this module
+# advertises. zlib.crc32 is deterministic across processes, platforms, and
+# Python versions, and 32 bits is plenty of entropy for seeding a test RNG.
 def _params_for_ticker(tkr: str) -> tuple[float, float, float, float]:
-    h = abs(hash(tkr)) % (10 ** 8)
+    h = zlib.crc32(tkr.encode("utf-8"))
     r2 = np.random.default_rng(h)
     start_price = float(r2.uniform(15, 400))
     drift = float(r2.uniform(0.04, 0.14))   # 4–14% annualized
