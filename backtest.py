@@ -105,7 +105,13 @@ YF_SUFFIX = {
 def yf_ticker(symbol: str, exchange: str) -> str:
     if exchange == "SEHK":
         return f"{int(symbol):04d}.HK"
-    return symbol.replace(".", "-") + YF_SUFFIX.get(exchange, "")
+    # IBKR LSE convention uses a trailing dot on single-class shares
+    # ("BP.", "RR.", "BA."). yfinance drops it and appends the venue suffix
+    # directly ("BP.L", "RR.L", "BA.L"). Strip trailing dots first.
+    s = symbol.rstrip(".")
+    # Internal dots ("BRK.B" on US, "BT.A" on LSE) → dash in yfinance.
+    s = s.replace(".", "-")
+    return s + YF_SUFFIX.get(exchange, "")
 
 
 # ══════════════════════════════════════════════════════════════════════════
