@@ -260,13 +260,15 @@ CACHE_DIR_DEFAULT = ".backtest_cache"
 def _cache_path(cache_dir: str, kind: str, key: str,
                 start: str, end: str) -> str:
     safe = key.replace("/", "_").replace("=", "_")
-    return os.path.join(cache_dir, f"{start}_{end}", kind, f"{safe}.parquet")
+    # Pickle format: no optional dependency (pyarrow / fastparquet) required
+    # — just pandas + stdlib. Fine for a local, user-machine cache.
+    return os.path.join(cache_dir, f"{start}_{end}", kind, f"{safe}.pkl")
 
 
 def _yf_download_cached(tkr: str, start: str, end: str,
                         cache_dir: Optional[str],
                         kind: str = "equity") -> pd.DataFrame:
-    """yf.download with on-disk parquet cache, keyed on (start, end, tkr).
+    """yf.download with on-disk pickle cache, keyed on (start, end, tkr).
 
     Dramatically speeds up repeat backtests and the sweep mode (where we run
     the same universe hundreds of times with different params). yfinance is
@@ -276,7 +278,7 @@ def _yf_download_cached(tkr: str, start: str, end: str,
         path = _cache_path(cache_dir, kind, tkr, start, end)
         if os.path.exists(path):
             try:
-                return pd.read_parquet(path)
+                return pd.read_pickle(path)
             except Exception:
                 pass  # Corrupt cache file → re-download
 
@@ -288,7 +290,7 @@ def _yf_download_cached(tkr: str, start: str, end: str,
     if cache_dir:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            df.to_parquet(path)
+            df.to_pickle(path)
         except Exception as e:
             print(f"   ⚠️  cache write failed for {tkr}: {e}")
     return df
