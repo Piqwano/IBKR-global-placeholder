@@ -1,23 +1,40 @@
 """
 Backtest — Global RSI Bot
 ===========================
-Vectorized historical simulation using the exact same signal logic as the
-live bot. Uses yfinance for data.
+Historical simulation that mirrors the live bot's signal + sizing logic.
+Uses yfinance for data.
 
 Fill modes (config.BACKTEST_FILL_MODE):
   - "next_open":  signal on day T fills at T+1 open (rigorous, no look-ahead)
   - "same_close": signal on day T fills at T's close (simpler, slightly optimistic)
 
+Alignment with live bot (v2.3.1 backtest hardening):
+  - Wilder RSI/ATR math matches ibkr_helpers.calc_rsi / calc_atr exactly
+    (SMA seed + recursion — previous pandas .ewm seed diverged on the first
+    ~30 bars).
+  - Position sizing applies the same volatility-adjusted scalar as
+    global_rsi_bot._apply_vol_scalar (target VOL_TARGET_ANNUAL, clamped to
+    [VOL_SCALAR_MIN, VOL_SCALAR_MAX]).
+  - New buys are blocked when projected gross exposure exceeds
+    MAX_GROSS_EXPOSURE_PCT of equity — mirrors try_buy's exposure ceiling.
+  - Trailing-stop / take-profit fills use intraday high/low instead of just
+    the close, and account for overnight gap-through:
+        stop fires if low ≤ stop_level    → fill = min(stop_level, open)
+        tp   fires if high ≥ tp_level     → fill = max(tp_level, open)
+  - On a BEAR regime day, prior-day pending entries are dropped rather than
+    silently filling; the live bot's scan_all_markets gates by regime too.
+  - MAX_COMMISSION_PCT from config replaces the previously hard-coded 0.03.
+
 Realistic costs: per-exchange commission + per-exchange bps slippage,
 tracked symmetrically on entry AND exit.
 
-FX-aware (external-review follow-up): positions are priced in their
-native currency; cash, equity, and reported P&L are in the chosen base
-currency (--base-currency USD|AUD, default USD). Non-base currencies
-pull FX series from yfinance (AUDUSD=X etc.), forward-filled across
-weekends/holidays. Commissions are assumed to already be in the base
-currency, matching the live bot's convention. If your base is not USD
-or AUD, verify the EXCHANGE_COMMISSIONS constants make sense for it.
+FX-aware: positions are priced in their native currency; cash, equity, and
+reported P&L are in the chosen base currency (--base-currency USD|AUD,
+default USD). Non-base currencies pull FX series from yfinance (AUDUSD=X
+etc.), forward-filled across weekends/holidays. Commissions are assumed
+to already be in the base currency, matching the live bot's convention.
+If your base is not USD or AUD, verify the EXCHANGE_COMMISSIONS constants
+make sense for it.
 
 Run:
     python backtest.py                                   # 3-year backtest
@@ -54,6 +71,9 @@ from config import (
     DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT,
     USE_ATR_STOPS, ATR_MULTIPLIER,
     BACKTEST_FILL_MODE,
+    USE_VOL_ADJUSTED_SIZING, VOL_TARGET_ANNUAL,
+    ATR_PERIOD_FOR_SIZING, VOL_SCALAR_MIN, VOL_SCALAR_MAX,
+    MAX_GROSS_EXPOSURE_PCT, MAX_COMMISSION_PCT,
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -156,25 +176,67 @@ def fx_rate(rates: Dict[str, pd.Series], ccy: str, date: pd.Timestamp) -> float:
 #  INDICATORS (Wilder RSI — matches live calc_rsi)
 # ══════════════════════════════════════════════════════════════════════════
 
+def _wilder_smooth(values: np.ndarray, period: int) -> np.ndarray:
+    """Wilder smoothing that exactly matches ibkr_helpers.calc_rsi / calc_atr:
+    seed = SMA of the first `period` observations, then recursion
+    smoothed_i = (smoothed_{i-1} * (period - 1) + values_i) / period."""
+    out = np.full_like(values, np.nan, dtype=float)
+    if len(values) < period:
+        return out
+    seed = np.mean(values[:period])
+    out[period - 1] = seed
+    prev = seed
+    for i in range(period, len(values)):
+        prev = (prev * (period - 1) + values[i]) / period
+        out[i] = prev
+    return out
+
+
 def rsi_series(closes: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    delta = closes.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    """Matches ibkr_helpers.calc_rsi exactly (Wilder SMA seed + recursion).
+
+    The previous implementation used pandas `ewm(adjust=False)` which lacks
+    the SMA warm-up, producing RSI values that diverged from the live bot
+    by ~1–3 points in the first ~30 bars. Aligning the seed eliminates a
+    material cause of backtest→live signal drift.
+    """
+    delta = closes.diff().to_numpy()
+    # calc_rsi operates on np.diff(closes), so index 0 of `delta` is np.nan.
+    deltas = delta[1:]
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = _wilder_smooth(gains, period)
+    avg_loss = _wilder_smooth(losses, period)
+    rs = np.divide(
+        avg_gain, avg_loss,
+        out=np.full_like(avg_gain, np.nan),
+        where=avg_loss > 0,
+    )
+    rsi_vals = 100.0 - (100.0 / (1.0 + rs))
+    # Where losses were all zero, live calc_rsi returns 100.
+    zero_loss = (avg_loss == 0) & ~np.isnan(avg_gain)
+    rsi_vals = np.where(zero_loss, 100.0, rsi_vals)
+    # Prepend NaN for the diff() we dropped so index aligns back with closes.
+    out = pd.Series(np.concatenate([[np.nan], rsi_vals]), index=closes.index)
+    return out.fillna(50)
 
 
-def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ATR_PERIOD) -> pd.Series:
+def atr_series(high: pd.Series, low: pd.Series, close: pd.Series,
+               period: int = ATR_PERIOD) -> pd.Series:
+    """Matches ibkr_helpers.calc_atr (Wilder smoothing of True Range)."""
     prev_close = close.shift(1)
-    tr = pd.concat([
+    tr_df = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    ], axis=1)
+    tr = tr_df.max(axis=1).to_numpy()
+    # calc_atr operates on tr starting at index 1 (i.e. drops the first row
+    # where prev_close is NaN). Mirror that shape.
+    tr_valid = tr[1:]
+    smoothed = _wilder_smooth(tr_valid, period)
+    out = pd.Series(np.concatenate([[np.nan], smoothed]), index=close.index)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -201,6 +263,13 @@ def load_data(symbols: List[Tuple[str, str, str, str]], start: str, end: str) ->
             df["ma200"] = df["close"].rolling(200, min_periods=1).mean()
             df["vol_avg20"] = df["volume"].rolling(20, min_periods=1).mean()
             df["atr"] = atr_series(df["high"], df["low"], df["close"])
+            # ATR for sizing — matches live `analyze()` which computes two
+            # ATRs: short (ATR_PERIOD for stops) and long (ATR_PERIOD_FOR_SIZING
+            # for the volatility-adjusted position scalar).
+            df["atr_sizing"] = atr_series(
+                df["high"], df["low"], df["close"],
+                period=ATR_PERIOD_FOR_SIZING,
+            )
             df["exchange"] = exchange
             df["currency"] = currency
             df["name"] = name
@@ -210,7 +279,12 @@ def load_data(symbols: List[Tuple[str, str, str, str]], start: str, end: str) ->
         except Exception as e:
             print(f"   ⚠️  {symbol} ({yt}) failed: {e}")
 
-    print(f"✅ Loaded data for {len(data)}/{len(symbols)} symbols")
+    coverage = len(data) / max(len(symbols), 1)
+    print(f"✅ Loaded data for {len(data)}/{len(symbols)} symbols "
+          f"({coverage*100:.0f}% coverage)")
+    if coverage < 0.5:
+        print(f"   🚨 WARNING: <50% of universe loaded — results will not be "
+              f"representative. Check yfinance availability for missing tickers.")
     return data
 
 
@@ -295,6 +369,10 @@ class Backtester:
     last_day: Optional[pd.Timestamp] = None
     halted: bool = False
     pending_entries: List[dict] = field(default_factory=list)
+    # Observability — counts of why candidate entries were rejected. Mirrors
+    # the reasons try_buy / scan_all_markets log in the live bot so backtest
+    # ergonomics match operator-facing diagnostics.
+    rejection_counts: Dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         self.cash = self.starting_capital
@@ -345,6 +423,27 @@ class Backtester:
                 native_value = pos.qty * pos.entry_price
             equity += self.native_to_base(native_value, pos.currency, today)
         return equity
+
+    def gross_exposure_base(self, data: Dict[str, pd.DataFrame],
+                            today: pd.Timestamp) -> float:
+        """Sum of position notionals (qty × last-known close) in base currency.
+
+        Mirrors global_rsi_bot._current_gross_exposure_base so the backtest
+        enforces MAX_GROSS_EXPOSURE_PCT the same way live does.
+        """
+        total = 0.0
+        for sym, pos in self.positions.items():
+            df = data.get(sym)
+            if df is not None and today in df.index:
+                mark_native = float(df.loc[today, "close"])
+            else:
+                mark_native = pos.entry_price
+            if mark_native <= 0:
+                continue
+            total += self.native_to_base(
+                pos.qty * mark_native, pos.currency, today,
+            )
+        return total
 
     def open_position(self, symbol: str, exchange: str, currency: str,
                       day: pd.Timestamp,
@@ -422,8 +521,40 @@ class Backtester:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  VOLATILITY-ADJUSTED SIZING (mirrors global_rsi_bot._apply_vol_scalar)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _apply_vol_scalar(base_amount: float, atr_sizing: Optional[float],
+                      price: float) -> float:
+    """Exact port of global_rsi_bot._apply_vol_scalar so backtest sizing
+    matches live sizing. Without this, the backtest systematically
+    over-sizes high-vol names and under-sizes low-vol names relative to
+    what the live bot would do.
+    """
+    if not USE_VOL_ADJUSTED_SIZING:
+        return base_amount
+    if atr_sizing is None or not price or price <= 0:
+        return base_amount
+    if not math.isfinite(atr_sizing) or atr_sizing <= 0:
+        return base_amount
+
+    atr_pct = atr_sizing / price
+    annualised_vol = atr_pct * math.sqrt(252)
+    if annualised_vol <= 0:
+        return base_amount
+
+    raw_scalar = VOL_TARGET_ANNUAL / annualised_vol
+    vol_scalar = max(VOL_SCALAR_MIN, min(VOL_SCALAR_MAX, raw_scalar))
+    return round(base_amount * vol_scalar, 2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  MAIN BACKTEST
 # ══════════════════════════════════════════════════════════════════════════
+
+def _bump(counts: Dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
 
 def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                  fx_rates: Dict[str, pd.Series],
@@ -448,44 +579,75 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
             bt.day_start_equity = bt.mark_to_market(data, today)
         bt.last_day = today
 
+        # Today's regime is needed twice (entry gate and pending-fill gate).
+        today_regime = None
+        today_mult = 0.0
+        if today in regime_df.index:
+            today_regime = regime_df.loc[today, "regime"]
+            today_mult = REGIME_SIZE_MULTIPLIERS[today_regime]
+
         # ── 0. Process pending entries from PREVIOUS bar (next_open mode) ──
+        # Live behaviour: try_buy checks regime / daily-halt / max-DD before
+        # placing the order. A BULL-day signal that wakes up on a BEAR-day
+        # would NOT fill in live, because scan_all_markets gates by regime
+        # first. Enforce the same gating here.
         if fill_mode == "next_open" and bt.pending_entries:
-            for pe in bt.pending_entries:
-                sym = pe["symbol"]
-                if sym in bt.positions:
-                    continue
-                if len(bt.positions) >= MAX_POSITIONS:
-                    continue
-                df = data.get(sym)
-                if df is None or today not in df.index:
-                    continue
-                fill_price = float(df.loc[today, "open"])
-                if math.isnan(fill_price):
-                    continue
-                bt.open_position(
-                    sym, pe["exchange"], pe["currency"], today,
-                    fill_price, pe["amount"], pe["cfg"],
-                )
+            pending_gated = bt.halted or today_mult == 0
+            if not pending_gated:
+                for pe in bt.pending_entries:
+                    sym = pe["symbol"]
+                    if sym in bt.positions:
+                        continue
+                    if len(bt.positions) >= MAX_POSITIONS:
+                        continue
+                    df = data.get(sym)
+                    if df is None or today not in df.index:
+                        continue
+                    fill_price = float(df.loc[today, "open"])
+                    if math.isnan(fill_price):
+                        continue
+                    bt.open_position(
+                        sym, pe["exchange"], pe["currency"], today,
+                        fill_price, pe["amount"], pe["cfg"],
+                    )
             bt.pending_entries = []
 
         # ── 1. Check exits on open positions ──────────────────────────────
+        # Realistic fills: use intraday high/low, account for gap-through on
+        # the stop (open < stop) and gap-up on TP (open > tp). Peak tracks
+        # the daily HIGH (not close) so the trailing stop behaves like the
+        # server-side IBKR trail that sees ticks, not close-prints.
         for sym in list(bt.positions.keys()):
             df = data.get(sym)
             if df is None or today not in df.index:
                 continue
             row = df.loc[today]
-            price = float(row["close"])
+            open_p = float(row["open"])
+            high_p = float(row["high"])
+            low_p = float(row["low"])
+            close_p = float(row["close"])
             pos = bt.positions[sym]
 
-            if price > pos.peak:
-                pos.peak = price
+            # Peak update BEFORE the stop check — the intraday high becomes
+            # the new peak candidate for today's trail calc.
+            if high_p > pos.peak:
+                pos.peak = high_p
+            stop_level = pos.current_stop()
+            tp_level = pos.tp_price()
 
-            if price <= pos.current_stop():
-                bt.close_position(sym, today, pos.current_stop(), "trailing_stop")
-            elif price >= pos.tp_price():
-                bt.close_position(sym, today, pos.tp_price(), "take_profit")
+            # Priority: if both TP and stop could trigger intraday we don't
+            # know which fired first on real data. Be conservative and assume
+            # stop fired first (worst-case for the bot).
+            if low_p <= stop_level:
+                # Gap-through: open already below the trail → fill at open.
+                fill = min(stop_level, open_p) if open_p < stop_level else stop_level
+                bt.close_position(sym, today, fill, "trailing_stop")
+            elif high_p >= tp_level:
+                # Gap-up: open already above TP → fill at open (positive slip).
+                fill = max(tp_level, open_p) if open_p > tp_level else tp_level
+                bt.close_position(sym, today, fill, "take_profit")
             elif float(row["rsi"]) >= pos.rsi_exit:
-                bt.close_position(sym, today, price, "rsi_overbought")
+                bt.close_position(sym, today, close_p, "rsi_overbought")
 
         # ── 2. Mark-to-market & loss limit checks ─────────────────────────
         equity = bt.mark_to_market(data, today)
@@ -509,19 +671,27 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
             continue
 
         # ── 3. Regime + sizing ────────────────────────────────────────────
-        if today not in regime_df.index:
+        if today_regime is None or today_mult == 0:
             continue
-        regime = regime_df.loc[today, "regime"]
-        mult = REGIME_SIZE_MULTIPLIERS[regime]
-        if mult == 0:
-            continue
+        mult = today_mult
 
         cash_pct = bt.cash / equity if equity > 0 else 0
         if cash_pct < CASH_RESERVE_PCT:
             continue
 
+        # Pre-compute gross exposure once per day (MAX_GROSS_EXPOSURE_PCT).
+        current_exposure_base = bt.gross_exposure_base(data, today)
+        exposure_cap_base = equity * MAX_GROSS_EXPOSURE_PCT
+
         # ── 4. Scan for entries ───────────────────────────────────────────
         pending_symbols = {pe["symbol"] for pe in bt.pending_entries}
+        # Track base-currency amount already promised by today's pending
+        # entries so that exposure-cap enforcement sees the full projected
+        # state, not just already-filled positions.
+        promised_base = sum(
+            pe["amount"] for pe in bt.pending_entries
+            if pe["symbol"] not in bt.positions
+        )
 
         for sym, df in data.items():
             if sym in bt.positions or sym in pending_symbols:
@@ -540,10 +710,13 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                 continue
 
             if USE_VOLUME_FILTER and float(row["volume"]) <= float(row["vol_avg20"]):
+                _bump(bt.rejection_counts, "volume_filter")
                 continue
             if USE_TREND_FILTER and price <= float(row["ma200"]):
+                _bump(bt.rejection_counts, "trend200_filter")
                 continue
             if USE_MA20_FILTER and price <= float(row["ma20"]):
+                _bump(bt.rejection_counts, "ma20_filter")
                 continue
 
             held = set(bt.positions.keys()) | pending_symbols
@@ -553,10 +726,29 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
                     violated = True
                     break
             if violated:
+                _bump(bt.rejection_counts, "correlation")
                 continue
 
-            amount = equity * POSITION_SIZE_PCT * mult
+            # Base sizing in BASE currency.
+            base_amount = equity * POSITION_SIZE_PCT * mult
+            # Apply vol-adjusted scalar (mirrors live _apply_vol_scalar).
+            atr_sizing_raw = row.get("atr_sizing")
+            try:
+                atr_sizing = float(atr_sizing_raw) if atr_sizing_raw is not None else None
+            except (TypeError, ValueError):
+                atr_sizing = None
+            if atr_sizing is not None and not math.isfinite(atr_sizing):
+                atr_sizing = None
+            amount = _apply_vol_scalar(base_amount, atr_sizing, price)
             if amount < 10:
+                _bump(bt.rejection_counts, "amount_below_min")
+                continue
+
+            # Gross-exposure cap (MAX_GROSS_EXPOSURE_PCT). This runs AFTER
+            # vol-scalar so the check sees the real intended deployment.
+            projected = current_exposure_base + promised_base + amount
+            if projected > exposure_cap_base:
+                _bump(bt.rejection_counts, "gross_exposure_cap")
                 continue
 
             cfg = ASSET_CONFIG.get(sym, {}).copy()
@@ -571,20 +763,25 @@ def run_backtest(data: Dict[str, pd.DataFrame], regime_df: pd.DataFrame,
             exchange = df["exchange"].iloc[0]
             currency = df["currency"].iloc[0]
             est_comm = EXCHANGE_COMMISSIONS.get(exchange, 10)
-            if est_comm / amount > 0.03:
+            if amount <= 0 or est_comm / amount > MAX_COMMISSION_PCT:
+                _bump(bt.rejection_counts, "commission_too_high")
                 continue
 
             if fill_mode == "next_open":
                 next_open = row.get("next_open")
                 if pd.isna(next_open):
+                    _bump(bt.rejection_counts, "no_next_open_bar")
                     continue
                 bt.pending_entries.append({
                     "symbol": sym, "exchange": exchange, "currency": currency,
                     "amount": amount, "cfg": cfg,
                 })
                 pending_symbols.add(sym)
+                promised_base += amount
             else:
-                bt.open_position(sym, exchange, currency, today, price, amount, cfg)
+                opened = bt.open_position(sym, exchange, currency, today, price, amount, cfg)
+                if opened:
+                    current_exposure_base += amount
 
     return bt
 
@@ -665,6 +862,14 @@ def print_metrics(bt: Backtester):
     print("\n  Bottom 5 losers:")
     for sym, pnl in sorted(sym_totals.items(), key=lambda x: x[1])[:5]:
         print(f"    {sym:<8} ${pnl:+,.2f} ({len(by_sym[sym])} trades)")
+
+    if bt.rejection_counts:
+        print("\n  Signal-rejection breakdown (RSI-eligible candidates "
+              "blocked by downstream filters):")
+        for reason, count in sorted(
+            bt.rejection_counts.items(), key=lambda x: -x[1]
+        ):
+            print(f"    {reason:<22} {count:>5}")
     print()
 
 
