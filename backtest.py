@@ -63,11 +63,24 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# yfinance is a runtime dependency for data loading, but the indicator
+# helpers, Backtester/Position dataclasses, and vol-scalar logic are pure
+# numpy/pandas — alignment tests and the synthetic-data harness import
+# this module without needing yfinance. Deferring the ImportError to
+# actual-use lets those paths work on minimal installs.
 try:
     import yfinance as yf
 except ImportError:
-    print("Please `pip install yfinance` to run the backtest.")
-    sys.exit(1)
+    yf = None
+
+
+def _require_yfinance():
+    """Raise a clear error if yfinance is needed but not installed."""
+    if yf is None:
+        raise RuntimeError(
+            "yfinance is required for this operation but is not installed. "
+            "Install it with: pip install yfinance"
+        )
 
 from config import (
     STOCK_UNIVERSE, ASSET_CONFIG, CORR_GROUPS, MAX_PER_CORR_GROUP,
@@ -288,6 +301,7 @@ def _yf_download_cached(tkr: str, start: str, end: str,
             except Exception:
                 pass  # Corrupt cache file → re-download
 
+    _require_yfinance()
     df = yf.download(tkr, start=start, end=end, progress=False,
                      auto_adjust=True)
     if df is None or df.empty:
