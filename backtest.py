@@ -1015,6 +1015,21 @@ def save_equity_csv(bt: Backtester, path: str = "backtest_equity.csv"):
 #  PARAMETER SWEEP
 # ══════════════════════════════════════════════════════════════════════════
 
+# Focused preset — 72 combos targeting what the quick/full presets did
+# NOT test: wider trails (up to 20%) and tighter take-profits (5-6%). The
+# quick sweep's winner (10% trail, 8% TP) still exits 46% of trades on
+# trailing_stop at an avg -6%, eating most of the 55% win rate. This grid
+# probes whether letting winners run further or taking profits earlier
+# fixes the avg_win ≈ avg_loss problem.
+SWEEP_FOCUSED = [
+    {"rsi_oversold": [35, 40]},
+    {"default_trailing_stop": [0.10, 0.12, 0.15, 0.20]},
+    {"default_take_profit": [0.05, 0.06, 0.08, 0.12]},
+    {"use_atr_stops": [True]},
+    {"atr_multiplier": [1.5, 2.5]},
+    {"use_trend_filter": [False, True]},
+]
+
 # Quick preset — 18 combos targeting the parameters we know are broken based
 # on the US-only baseline (too many trailing_stops firing at -3.5%).
 # Focused on loosening the exit and adding the trend filter.
@@ -1042,6 +1057,8 @@ def build_param_grid(preset: str) -> List[StrategyParams]:
     the preset list contributes one axis of the Cartesian product."""
     if preset == "quick":
         spec = SWEEP_QUICK
+    elif preset == "focused":
+        spec = SWEEP_FOCUSED
     elif preset == "full":
         spec = SWEEP_FULL
     else:
@@ -1230,9 +1247,11 @@ def main():
                              "string to disable caching.")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable yfinance disk cache (equivalent to --cache-dir='').")
-    parser.add_argument("--sweep", choices=["quick", "full"], default=None,
+    parser.add_argument("--sweep", choices=["quick", "focused", "full"], default=None,
                         help="Run a parameter sweep instead of a single backtest. "
-                             "'quick' ≈ 36 combos, 'full' ≈ 576 combos.")
+                             "'quick' ≈ 36 combos (fast first pass), "
+                             "'focused' ≈ 64 combos (wider trails + tighter TPs), "
+                             "'full' ≈ 432 combos (exhaustive).")
     parser.add_argument("--sweep-rank",
                         choices=list(RANK_MODES.keys()), default="sharpe",
                         help="Metric to rank sweep results by (default: sharpe).")
