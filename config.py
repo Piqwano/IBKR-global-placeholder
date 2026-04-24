@@ -65,23 +65,25 @@ USE_MA20_FILTER = False
 #  EXITS
 # ══════════════════════════════════════════════════════════════════════════
 
-# Widened from 0.06 → 0.10 after the 2022-2024 US-only parameter sweep
-# (backtest.py --sweep quick, ranked by Sharpe). The old 6% trail was
-# firing on ~67% of trades at an average -3.5% loss because mean-reversion
-# entries into oversold stocks face elevated intraday volatility that
-# routinely punches through a tight trail before the bounce plays out.
-# 10% paired with ATR-based stops (below) gave the best risk-adjusted
-# return in the sweep.
-DEFAULT_TRAILING_STOP = 0.10
-DEFAULT_TAKE_PROFIT = 0.08
+# Final config after two sweep passes on 2019-2026 full-universe AUD data:
+#   pass 1 (quick):    0.06 → 0.10 trail, USE_ATR_STOPS on
+#   pass 2 (focused):  0.10 → 0.20 trail, 0.08 → 0.06 TP, ATR mult 1.5 → 2.5
+#
+# The wide trail + tight TP combo flipped win rate from ~53% → ~66% by
+# capturing mean-reversion bounces early instead of letting them round-trip
+# into trailing-stop losses. Expected CAGR on 7-year sample is +1.4% with
+# max DD -7.4% — a modest, low-correlation edge rather than a wealth
+# builder. See README "Backtest" section for full leaderboard context.
+#
+# Per-asset overrides in ASSET_CONFIG (NVDA/TSLA/etc.) are intentionally
+# left untouched — they were part of the sweep sample, so the reported
+# performance already reflects their behaviour alongside these defaults.
+DEFAULT_TRAILING_STOP = 0.20
+DEFAULT_TAKE_PROFIT = 0.06
 
-# Enabled by the same sweep — volatility-adaptive stops. For each trade
-# the effective stop is max(DEFAULT_TRAILING_STOP, ATR_MULTIPLIER × ATR / price).
-# Low-vol names keep the 10% floor; high-vol names get a wider, ATR-sized
-# stop so they aren't whipsawed out prematurely.
 USE_ATR_STOPS = True
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.5
+ATR_MULTIPLIER = 2.5
 
 USE_BRACKET_ORDERS = True
 REPAIR_TP_AFTER_FILL = True
